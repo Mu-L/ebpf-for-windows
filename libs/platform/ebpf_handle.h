@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "ebpf_core_structs.h"
 #include "ebpf_object.h"
 #include "ebpf_platform.h"
 
@@ -10,9 +11,6 @@
 extern "C"
 {
 #endif
-
-    typedef uint64_t ebpf_handle_t;
-
     /**
      * @brief Initialize the global handle table.
      *
@@ -38,7 +36,7 @@ extern "C"
      *  operation.
      */
     ebpf_result_t
-    ebpf_handle_create(ebpf_handle_t* handle, ebpf_object_t* object);
+    ebpf_handle_create(ebpf_handle_t* handle, struct _ebpf_object* object);
 
     /**
      * @brief Remove an existing handle from the handle table and release its
@@ -59,10 +57,10 @@ extern "C"
      * @param[in] object_type Object type to match.
      * @param[out] object Pointer to memory that contains object success.
      * @retval EBPF_SUCCESS The operation was successful.
-     * @retval EBPF_ERROR_INVALID_HANDLE The provided handle is not valid.
+     * @retval EBPF_INVALID_OBJECT The provided handle is not valid.
      */
     ebpf_result_t
-    ebpf_reference_object_by_handle(ebpf_handle_t handle, ebpf_object_type_t object_type, ebpf_object_t** object);
+    ebpf_reference_object_by_handle(ebpf_handle_t handle, ebpf_object_type_t object_type, struct _ebpf_object** object);
 
 #ifdef __cplusplus
 }

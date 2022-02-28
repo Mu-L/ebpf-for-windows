@@ -14,6 +14,14 @@ typedef struct _ebpf_memory_descriptor
     MDL memory_descriptor_list;
 } ebpf_memory_descriptor_t;
 
+struct _ebpf_ring_descriptor
+{
+    MDL* memory_descriptor_list;
+    ebpf_memory_descriptor_t* memory;
+    void* base_address;
+};
+typedef struct _ebpf_ring_descriptor ebpf_ring_descriptor_t;
+
 typedef enum _ebpf_pool_tag
 {
     EBPF_POOL_TAG = 'fpbe'
@@ -30,12 +38,30 @@ ebpf_platform_initiate()
 
 void
 ebpf_platform_terminate()
-{}
+{
+    KeFlushQueuedDpcs();
+}
 
 __drv_allocatesMem(Mem) _Must_inspect_result_ _Ret_maybenull_
     _Post_writable_byte_size_(size) void* ebpf_allocate(size_t size)
 {
-    return ExAllocatePool2(POOL_FLAG_NON_PAGED, size, EBPF_POOL_TAG);
+    void* p = ExAllocatePoolUninitialized(NonPagedPoolNx, size, EBPF_POOL_TAG);
+    if (p)
+        memset(p, 0, size);
+    return p;
+}
+
+__drv_allocatesMem(Mem) _Must_inspect_result_ _Ret_maybenull_
+    _Post_writable_byte_size_(new_size) void* ebpf_reallocate(_In_ void* memory, size_t old_size, size_t new_size)
+{
+    void* p = ebpf_allocate(new_size);
+    if (p) {
+        memcpy(p, memory, min(old_size, new_size));
+        if (new_size > old_size)
+            memset(((char*)p) + old_size, 0, new_size - old_size);
+        ebpf_free(memory);
+    }
+    return p;
 }
 
 void
@@ -45,9 +71,26 @@ ebpf_free(_Frees_ptr_opt_ void* memory)
         ExFreePool(memory);
 }
 
+__drv_allocatesMem(Mem) _Must_inspect_result_ _Ret_maybenull_
+    _Post_writable_byte_size_(size) void* ebpf_allocate_cache_aligned(size_t size)
+{
+    void* p = ExAllocatePoolUninitialized(NonPagedPoolNxCacheAligned, size, EBPF_POOL_TAG);
+    if (p)
+        memset(p, 0, size);
+    return p;
+}
+
+void
+ebpf_free_cache_aligned(_Frees_ptr_opt_ void* memory)
+{
+    if (memory)
+        ExFreePool(memory);
+}
+
 ebpf_memory_descriptor_t*
 ebpf_map_memory(size_t length)
 {
+    EBPF_LOG_ENTRY();
     MDL* memory_descriptor_list = NULL;
     PHYSICAL_ADDRESS start_address;
     PHYSICAL_ADDRESS end_address;
@@ -62,30 +105,35 @@ ebpf_map_memory(size_t length)
         void* address =
             MmMapLockedPagesSpecifyCache(memory_descriptor_list, KernelMode, MmCached, NULL, FALSE, NormalPagePriority);
         if (!address) {
+            EBPF_LOG_NTSTATUS_API_FAILURE(EBPF_TRACELOG_KEYWORD_BASE, MmMapLockedPagesSpecifyCache, STATUS_NO_MEMORY);
             MmFreePagesFromMdl(memory_descriptor_list);
             ExFreePool(memory_descriptor_list);
             memory_descriptor_list = NULL;
         }
+    } else {
+        EBPF_LOG_NTSTATUS_API_FAILURE(EBPF_TRACELOG_KEYWORD_BASE, MmAllocatePagesForMdlEx, STATUS_NO_MEMORY);
     }
-
-    return (ebpf_memory_descriptor_t*)memory_descriptor_list;
+    EBPF_RETURN_POINTER(ebpf_memory_descriptor_t*, memory_descriptor_list);
 }
 
 void
 ebpf_unmap_memory(_Frees_ptr_opt_ ebpf_memory_descriptor_t* memory_descriptor)
 {
+    EBPF_LOG_ENTRY();
     if (!memory_descriptor)
-        return;
+        EBPF_RETURN_VOID();
 
     MmUnmapLockedPages(
         ebpf_memory_descriptor_get_base_address(memory_descriptor), &memory_descriptor->memory_descriptor_list);
     MmFreePagesFromMdl(&memory_descriptor->memory_descriptor_list);
     ExFreePool(memory_descriptor);
+    EBPF_RETURN_VOID();
 }
 
 ebpf_result_t
 ebpf_protect_memory(_In_ const ebpf_memory_descriptor_t* memory_descriptor, ebpf_page_protection_t protection)
 {
+    EBPF_LOG_ENTRY();
     NTSTATUS status;
     ULONG mm_protection_state = 0;
     switch (protection) {
@@ -99,22 +147,145 @@ ebpf_protect_memory(_In_ const ebpf_memory_descriptor_t* memory_descriptor, ebpf
         mm_protection_state = PAGE_EXECUTE_READ;
         break;
     default:
-        return EBPF_INVALID_ARGUMENT;
+        EBPF_RETURN_RESULT(EBPF_INVALID_ARGUMENT);
     }
 
     status = MmProtectMdlSystemAddress((MDL*)&memory_descriptor->memory_descriptor_list, mm_protection_state);
-    if (!NT_SUCCESS(status))
-        return EBPF_INVALID_ARGUMENT;
+    if (!NT_SUCCESS(status)) {
+        EBPF_LOG_NTSTATUS_API_FAILURE(EBPF_TRACELOG_KEYWORD_BASE, MmProtectMdlSystemAddress, status);
+        EBPF_RETURN_RESULT(EBPF_INVALID_ARGUMENT);
+    }
 
-    return EBPF_SUCCESS;
+    EBPF_RETURN_RESULT(EBPF_SUCCESS);
 }
 
 void*
 ebpf_memory_descriptor_get_base_address(ebpf_memory_descriptor_t* memory_descriptor)
 {
-    return MmGetSystemAddressForMdlSafe(&memory_descriptor->memory_descriptor_list, NormalPagePriority);
+    void* address = MmGetSystemAddressForMdlSafe(&memory_descriptor->memory_descriptor_list, NormalPagePriority);
+    if (!address) {
+        EBPF_LOG_NTSTATUS_API_FAILURE(EBPF_TRACELOG_KEYWORD_BASE, MmGetSystemAddressForMdlSafe, STATUS_NO_MEMORY);
+    }
+    return address;
 }
 
+_Ret_maybenull_ ebpf_ring_descriptor_t*
+ebpf_allocate_ring_buffer_memory(size_t length)
+{
+    EBPF_LOG_ENTRY();
+    NTSTATUS status;
+    size_t requested_page_count = length / PAGE_SIZE;
+
+    ebpf_ring_descriptor_t* ring_descriptor = ebpf_allocate(sizeof(ebpf_ring_descriptor_t));
+    MDL* source_mdl = NULL;
+    MDL* new_mdl = NULL;
+
+    if (!ring_descriptor) {
+        status = STATUS_NO_MEMORY;
+        goto Done;
+    }
+
+    if (length % PAGE_SIZE != 0 || length > MAXUINT32 / 2) {
+        status = STATUS_NO_MEMORY;
+        EBPF_LOG_MESSAGE_UINT64(
+            EBPF_TRACELOG_LEVEL_ERROR,
+            EBPF_TRACELOG_KEYWORD_BASE,
+            "Ring buffer length doesn't match allocation granularity",
+            length);
+        goto Done;
+    }
+
+    // Allocate pages using ebpf_map_memory.
+    ring_descriptor->memory = ebpf_map_memory(requested_page_count * PAGE_SIZE);
+    if (!ring_descriptor->memory) {
+        status = STATUS_NO_MEMORY;
+        goto Done;
+    }
+    source_mdl = &ring_descriptor->memory->memory_descriptor_list;
+
+    // Create a MDL big enough to double map the pages.
+    ring_descriptor->memory_descriptor_list =
+        IoAllocateMdl(NULL, (uint32_t)(requested_page_count * 2 * PAGE_SIZE), FALSE, FALSE, NULL);
+    if (!ring_descriptor->memory_descriptor_list) {
+        EBPF_LOG_NTSTATUS_API_FAILURE(EBPF_TRACELOG_KEYWORD_BASE, IoAllocateMdl, STATUS_NO_MEMORY);
+        status = STATUS_NO_MEMORY;
+        goto Done;
+    }
+    new_mdl = ring_descriptor->memory_descriptor_list;
+
+    memcpy(MmGetMdlPfnArray(new_mdl), MmGetMdlPfnArray(source_mdl), sizeof(PFN_NUMBER) * requested_page_count);
+
+    memcpy(
+        MmGetMdlPfnArray(new_mdl) + requested_page_count,
+        MmGetMdlPfnArray(source_mdl),
+        sizeof(PFN_NUMBER) * requested_page_count);
+
+#pragma warning(push)
+#pragma warning(disable : 28145) /* The opaque MDL structure should not be modified by a driver except for \
+                                    MDL_PAGES_LOCKED and MDL_MAPPING_CAN_FAIL. */
+    new_mdl->MdlFlags |= MDL_PAGES_LOCKED;
+#pragma warning(pop)
+
+    ring_descriptor->base_address = MmMapLockedPagesSpecifyCache(
+        new_mdl, KernelMode, MmCached, NULL, FALSE, NormalPagePriority | MdlMappingNoExecute);
+    if (!ring_descriptor->base_address) {
+        EBPF_LOG_NTSTATUS_API_FAILURE(EBPF_TRACELOG_KEYWORD_BASE, MmMapLockedPagesSpecifyCache, STATUS_NO_MEMORY);
+        status = STATUS_NO_MEMORY;
+        goto Done;
+    }
+
+    status = STATUS_SUCCESS;
+
+Done:
+    if (!NT_SUCCESS(status)) {
+        if (ring_descriptor) {
+            if (ring_descriptor->memory_descriptor_list) {
+                IoFreeMdl(ring_descriptor->memory_descriptor_list);
+            }
+            if (ring_descriptor->memory) {
+                ebpf_unmap_memory(ring_descriptor->memory);
+            }
+            ebpf_free(ring_descriptor);
+            ring_descriptor = NULL;
+        }
+    }
+
+    EBPF_RETURN_POINTER(ebpf_ring_descriptor_t*, ring_descriptor);
+}
+
+void
+ebpf_free_ring_buffer_memory(_Frees_ptr_opt_ ebpf_ring_descriptor_t* ring)
+{
+    EBPF_LOG_ENTRY();
+    if (!ring) {
+        EBPF_RETURN_VOID();
+    }
+
+    MmUnmapLockedPages(ring->base_address, ring->memory_descriptor_list);
+
+    IoFreeMdl(ring->memory_descriptor_list);
+    ebpf_unmap_memory(ring->memory);
+    ebpf_free(ring);
+    EBPF_RETURN_VOID();
+}
+
+void*
+ebpf_ring_descriptor_get_base_address(_In_ ebpf_ring_descriptor_t* memory_descriptor)
+{
+    return memory_descriptor->base_address;
+}
+
+_Ret_maybenull_ void*
+ebpf_ring_map_readonly_user(_In_ ebpf_ring_descriptor_t* ring)
+{
+    __try {
+        return MmMapLockedPagesSpecifyCache(
+            ring->memory_descriptor_list, UserMode, MmCached, NULL, FALSE, NormalPagePriority | MdlMappingNoWrite);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        EBPF_LOG_NTSTATUS_API_FAILURE(EBPF_TRACELOG_KEYWORD_BASE, MmMapLockedPagesSpecifyCache, STATUS_NO_MEMORY);
+        return NULL;
+    }
+}
 // There isn't an official API to query this information from kernel.
 // Use NtQuerySystemInformation with struct + header from winternl.h.
 
@@ -144,11 +315,16 @@ ebpf_get_code_integrity_state(_Out_ ebpf_code_integrity_state_t* state)
     status = NtQuerySystemInformation(
         SystemCodeIntegrityInformation, &code_integrity_information, system_information_length, &returned_length);
     if (NT_SUCCESS(status)) {
-        *state = (code_integrity_information.CodeIntegrityOptions & CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED) != 0
-                     ? EBPF_CODE_INTEGRITY_HYPER_VISOR_KERNEL_MODE
-                     : EBPF_CODE_INTEGRITY_DEFAULT;
+        if ((code_integrity_information.CodeIntegrityOptions & CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED) != 0) {
+            EBPF_LOG_MESSAGE(EBPF_TRACELOG_LEVEL_INFO, EBPF_TRACELOG_KEYWORD_BASE, "Code integrity enabled");
+            *state = EBPF_CODE_INTEGRITY_HYPERVISOR_KERNEL_MODE;
+        } else {
+            EBPF_LOG_MESSAGE(EBPF_TRACELOG_LEVEL_INFO, EBPF_TRACELOG_KEYWORD_BASE, "Code integrity disabled");
+            *state = EBPF_CODE_INTEGRITY_DEFAULT;
+        }
         return EBPF_SUCCESS;
     } else {
+        EBPF_LOG_NTSTATUS_API_FAILURE(EBPF_TRACELOG_KEYWORD_BASE, NtQuerySystemInformation, status);
         return EBPF_OPERATION_NOT_SUPPORTED;
     }
 }
@@ -227,17 +403,38 @@ ebpf_interlocked_compare_exchange_int32(_Inout_ volatile int32_t* destination, i
     return InterlockedCompareExchange((long volatile*)destination, exchange, comperand);
 }
 
-void
-ebpf_get_cpu_count(_Out_ uint32_t* cpu_count)
+void*
+ebpf_interlocked_compare_exchange_pointer(
+    _Inout_ void* volatile* destination, _In_opt_ const void* exchange, _In_opt_ const void* comperand)
 {
-    *cpu_count = KeQueryMaximumProcessorCount();
+    return InterlockedCompareExchangePointer((void* volatile*)destination, (void*)exchange, (void*)comperand);
 }
+
+ebpf_result_t
+ebpf_set_current_thread_affinity(uintptr_t new_thread_affinity_mask, _Out_ uintptr_t* old_thread_affinity_mask)
+{
+    if (KeGetCurrentIrql() > PASSIVE_LEVEL) {
+        return EBPF_OPERATION_NOT_SUPPORTED;
+    }
+
+    KAFFINITY old_affinity = KeSetSystemAffinityThreadEx(new_thread_affinity_mask);
+    *old_thread_affinity_mask = old_affinity;
+    return EBPF_SUCCESS;
+}
+
+void
+ebpf_restore_current_thread_affinity(uintptr_t old_thread_affinity_mask)
+{
+    KeRevertToUserAffinityThreadEx(old_thread_affinity_mask);
+}
+
+_Ret_range_(>, 0) uint32_t ebpf_get_cpu_count() { return KeQueryMaximumProcessorCount(); }
 
 bool
 ebpf_is_preemptible()
 {
     KIRQL irql = KeGetCurrentIrql();
-    return irql >= DISPATCH_LEVEL;
+    return irql < DISPATCH_LEVEL;
 }
 
 bool
@@ -311,8 +508,8 @@ ebpf_queue_non_preemptible_work_item(_In_ ebpf_non_preemptible_work_item_t* work
 
 typedef struct _ebpf_timer_work_item
 {
-    KTIMER timer;
     KDPC deferred_procedure_call;
+    KTIMER timer;
     void (*work_item_routine)(void* work_item_context);
     void* work_item_context;
 } ebpf_timer_work_item_t;
@@ -381,7 +578,7 @@ ebpf_log_function(_In_ void* context, _In_z_ const char* format_string, ...)
 
     status = RtlStringCchVPrintfA(buffer, sizeof(buffer), format_string, arg_start);
     if (NT_SUCCESS(status)) {
-        KdPrintEx((DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "eBPF: context: %s\n", buffer));
+        EBPF_LOG_MESSAGE(EBPF_TRACELOG_LEVEL_ERROR, EBPF_TRACELOG_KEYWORD_ERROR, buffer);
     }
 
     va_end(arg_start);
@@ -443,4 +640,38 @@ ebpf_validate_security_descriptor(
 
 Done:
     return result;
+}
+
+uint32_t
+ebpf_random_uint32()
+{
+    LARGE_INTEGER p = KeQueryPerformanceCounter(NULL);
+    ULONG seed = p.LowPart ^ (DWORD)p.HighPart;
+    return RtlRandomEx(&seed);
+}
+
+uint64_t
+ebpf_query_time_since_boot(bool include_suspended_time)
+{
+    uint64_t qpc_time;
+    if (include_suspended_time) {
+        // KeQueryUnbiasedInterruptTimePrecise returns the current interrupt-time count in 100-nanosecond units.
+        // Unbiased Interrupt time is the total time since boot including time spent suspended.
+        // https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-kequeryunbiasedinterrupttimeprecise
+        return KeQueryUnbiasedInterruptTimePrecise(&qpc_time);
+    } else {
+        // KeQueryInterruptTimePrecise returns the current interrupt-time count in 100-nanosecond units.
+        // (Biased) Interrupt time is the total time since boot excluding time spent suspended.        //
+        // https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-kequeryinterrupttimeprecise
+        return KeQueryInterruptTimePrecise(&qpc_time);
+    }
+}
+
+ebpf_result_t
+ebpf_guid_create(_Out_ GUID* new_guid)
+{
+    if (NT_SUCCESS(ExUuidCreate(new_guid)))
+        return EBPF_SUCCESS;
+    else
+        return EBPF_OPERATION_NOT_SUPPORTED;
 }

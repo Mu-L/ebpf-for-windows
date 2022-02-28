@@ -49,6 +49,8 @@ static BOOLEAN _ebpf_driver_unloading_flag = FALSE;
 //
 static EVT_WDF_FILE_CLOSE _ebpf_driver_file_close;
 static EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL _ebpf_driver_io_device_control;
+static EVT_WDFDEVICE_WDM_IRP_PREPROCESS _ebpf_driver_query_volume_information;
+static EVT_WDF_REQUEST_CANCEL _ebpf_driver_io_device_control_cancel;
 DRIVER_INITIALIZE DriverEntry;
 
 static VOID
@@ -58,54 +60,6 @@ _ebpf_driver_io_device_control(
     size_t output_buffer_length,
     size_t input_buffer_length,
     ULONG io_control_code);
-
-inline NTSTATUS
-_ebpf_result_to_ntstatus(ebpf_result_t result)
-{
-    NTSTATUS status;
-    switch (result) {
-    case EBPF_SUCCESS: {
-        status = STATUS_SUCCESS;
-        break;
-    }
-    case EBPF_NO_MEMORY: {
-        status = STATUS_INSUFFICIENT_RESOURCES;
-        break;
-    }
-    case EBPF_KEY_NOT_FOUND: {
-        status = STATUS_NOT_FOUND;
-        break;
-    }
-    case EBPF_INVALID_ARGUMENT: {
-        status = STATUS_INVALID_PARAMETER;
-        break;
-    }
-    case EBPF_BLOCKED_BY_POLICY: {
-        status = STATUS_CONTENT_BLOCKED;
-        break;
-    }
-    case EBPF_NO_MORE_KEYS: {
-        status = STATUS_NO_MORE_MATCHES;
-        break;
-    }
-    case EBPF_INVALID_OBJECT: {
-        status = STATUS_INVALID_HANDLE;
-        break;
-    }
-    case EBPF_OPERATION_NOT_SUPPORTED: {
-        status = STATUS_NOT_SUPPORTED;
-        break;
-    }
-    case EBPF_INSUFFICIENT_BUFFER: {
-        status = STATUS_BUFFER_OVERFLOW;
-        break;
-    }
-    default:
-        status = STATUS_UNSUCCESSFUL;
-    }
-
-    return status;
-}
 
 static _Function_class_(EVT_WDF_DRIVER_UNLOAD) _IRQL_requires_same_
     _IRQL_requires_max_(PASSIVE_LEVEL) void _ebpf_driver_unload(_In_ WDFDRIVER driver_object)
@@ -160,7 +114,7 @@ _ebpf_driver_initialize_objects(
         goto Exit;
     }
 
-    WdfDeviceInitSetDeviceType(device_initialize, FILE_DEVICE_NETWORK);
+    WdfDeviceInitSetDeviceType(device_initialize, FILE_DEVICE_NULL);
 
     WdfDeviceInitSetCharacteristics(device_initialize, FILE_DEVICE_SECURE_OPEN, FALSE);
 
@@ -181,6 +135,14 @@ _ebpf_driver_initialize_objects(
         WDF_NO_EVENT_CALLBACK // No cleanup callback function
     );
     WdfDeviceInitSetFileObjectConfig(device_initialize, &file_object_config, &attributes);
+
+    // WDF framework doesn't handle IRP_MJ_QUERY_VOLUME_INFORMATION.
+    // Register a handler for this IRP.
+    status = WdfDeviceInitAssignWdmIrpPreprocessCallback(
+        device_initialize, _ebpf_driver_query_volume_information, IRP_MJ_QUERY_VOLUME_INFORMATION, NULL, 0);
+    if (!NT_SUCCESS(status)) {
+        goto Exit;
+    }
 
     status = WdfDeviceCreate(&device_initialize, WDF_NO_OBJECT_ATTRIBUTES, device);
 
@@ -217,7 +179,7 @@ _ebpf_driver_initialize_objects(
         goto Exit;
     }
 
-    status = _ebpf_result_to_ntstatus(ebpf_core_initiate());
+    status = ebpf_result_to_ntstatus(ebpf_core_initiate());
     if (!NT_SUCCESS(status)) {
         goto Exit;
     }
@@ -244,6 +206,24 @@ _ebpf_driver_file_close(WDFFILEOBJECT wdf_file_object)
     ebpf_object_release_reference(file_object->FsContext2);
 }
 
+static void
+_ebpf_driver_io_device_control_complete(void* context, size_t output_buffer_length, ebpf_result_t result)
+{
+    NTSTATUS status;
+    WDFREQUEST request = (WDFREQUEST)context;
+    status = WdfRequestUnmarkCancelable(request);
+    UNREFERENCED_PARAMETER(status);
+    WdfRequestCompleteWithInformation(request, ebpf_result_to_ntstatus(result), output_buffer_length);
+    WdfObjectDereference(request);
+}
+
+static void
+_ebpf_driver_io_device_control_cancel(WDFREQUEST request)
+{
+    // https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdfrequest/nc-wdfrequest-evt_wdf_request_cancel
+    ebpf_core_cancel_protocol_handler(request);
+}
+
 static VOID
 _ebpf_driver_io_device_control(
     _In_ WDFQUEUE queue,
@@ -260,6 +240,7 @@ _ebpf_driver_io_device_control(
     size_t actual_output_length = 0;
     const struct _ebpf_operation_header* user_request = NULL;
     struct _ebpf_operation_header* user_reply = NULL;
+    bool async = false;
 
     device = WdfIoQueueGetDevice(queue);
 
@@ -289,6 +270,7 @@ _ebpf_driver_io_device_control(
             if (input_buffer != NULL) {
                 size_t minimum_request_size = 0;
                 size_t minimum_reply_size = 0;
+                void* async_context = NULL;
 
                 user_request = input_buffer;
                 if (actual_input_length < sizeof(struct _ebpf_operation_header)) {
@@ -296,8 +278,8 @@ _ebpf_driver_io_device_control(
                     goto Done;
                 }
 
-                status = _ebpf_result_to_ntstatus(ebpf_core_get_protocol_handler_properties(
-                    user_request->id, &minimum_request_size, &minimum_reply_size));
+                status = ebpf_result_to_ntstatus(ebpf_core_get_protocol_handler_properties(
+                    user_request->id, &minimum_request_size, &minimum_reply_size, &async));
                 if (status != STATUS_SUCCESS)
                     goto Done;
 
@@ -323,14 +305,25 @@ _ebpf_driver_io_device_control(
                     user_reply = output_buffer;
                 }
 
-                status = _ebpf_result_to_ntstatus(ebpf_core_invoke_protocol_handler(
-                    user_request->id, user_request, user_reply, (uint16_t)actual_output_length));
+                if (async) {
+                    WdfObjectReference(request);
+                    async_context = request;
+                    WdfRequestMarkCancelable(request, _ebpf_driver_io_device_control_cancel);
+                }
+
+                status = ebpf_result_to_ntstatus(ebpf_core_invoke_protocol_handler(
+                    user_request->id,
+                    user_request,
+                    user_reply,
+                    (uint16_t)actual_output_length,
+                    async_context,
+                    _ebpf_driver_io_device_control_complete));
 
                 // Fill out the rest of the out buffer after processing the input
                 // buffer.
                 if (status == STATUS_SUCCESS && user_reply) {
                     user_reply->id = user_request->id;
-                    user_reply->length = (uint16_t)actual_output_length;
+                    user_reply->length = min((uint16_t)actual_output_length, user_reply->length);
                 }
                 goto Done;
             }
@@ -344,7 +337,14 @@ _ebpf_driver_io_device_control(
     }
 
 Done:
-    WdfRequestCompleteWithInformation(request, status, output_buffer_length);
+    if (status != STATUS_PENDING) {
+        if (async) {
+            ebpf_assert(status != STATUS_SUCCESS);
+            // Async operation failed. Remove cancellable marker.
+            (void)WdfRequestUnmarkCancelable(request);
+        }
+        WdfRequestCompleteWithInformation(request, status, output_buffer_length);
+    }
     return;
 }
 
@@ -376,4 +376,36 @@ DEVICE_OBJECT*
 ebpf_driver_get_device_object()
 {
     return _ebpf_driver_device_object;
+}
+
+// The C runtime queries the file type via GetFileType when creating a file
+// descriptor. GetFileType queries volume information to get device type via
+// FileFsDeviceInformation information class.
+NTSTATUS
+_ebpf_driver_query_volume_information(_In_ WDFDEVICE device, _Inout_ IRP* irp)
+{
+    NTSTATUS status;
+    IO_STACK_LOCATION* irp_stack_location;
+    UNREFERENCED_PARAMETER(device);
+    irp_stack_location = IoGetCurrentIrpStackLocation(irp);
+
+    switch (irp_stack_location->Parameters.QueryVolume.FsInformationClass) {
+    case FileFsDeviceInformation:
+        if (irp_stack_location->Parameters.DeviceIoControl.OutputBufferLength < sizeof(FILE_FS_DEVICE_INFORMATION)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+        } else {
+            FILE_FS_DEVICE_INFORMATION* device_info = (FILE_FS_DEVICE_INFORMATION*)irp->AssociatedIrp.SystemBuffer;
+            device_info->DeviceType = FILE_DEVICE_NULL;
+            device_info->Characteristics = 0;
+            status = STATUS_SUCCESS;
+        }
+        break;
+    default:
+        status = STATUS_NOT_SUPPORTED;
+        break;
+    }
+
+    irp->IoStatus.Status = status;
+    IoCompleteRequest(irp, 0);
+    return status;
 }

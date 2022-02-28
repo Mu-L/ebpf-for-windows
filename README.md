@@ -8,7 +8,8 @@ takes existing eBPF projects as submodules and adds the layer in between to make
 
 ## New to eBPF?
 
-See our [eBPF tutorial](docs/tutorial.md).
+See our [basic eBPF tutorial](docs/tutorial.md) and our
+[tutorial on debugging eBPF verification failures](docs/debugging.md).
 
 ## Architectural Overview
 
@@ -17,37 +18,40 @@ The following diagram shows the architecture of this project and related compone
 ![Architectural Overview](docs/ArchitectureDiagram.png)
 
 As shown in the diagram, existing eBPF toolchains (clang, etc.) can be used to generate eBPF bytecode from
-source code in various languages.  Bytecode can be consumed by any application, or via the Netsh command line tool, which use a shared library
+source code in various languages.  Bytecode can be consumed by any application, or via bpftool or the Netsh command line tool, which use a shared library
 that exposes [Libbpf APIs](https://github.com/libbpf/libbpf),
 though this is still in progress.
 
 The eBPF bytecode is sent to a static verifier (the [PREVAIL verifier](https://github.com/vbpf/ebpf-verifier))
-that is hosted in a user-mode [protected process](https://docs.microsoft.com/en-us/windows/win32/services/protecting-anti-malware-services-#system-protected-process)
-(a Windows security environment that allows a kernel component to trust a user-mode daemon signed by
-a key that it trusts).  If the bytecode passes all the verifier checks, it can be either loaded into
+that is hosted in a secure user-mode environment such as a system service (which is the case at present),
+enclave, or trusted VM.
+If the bytecode passes all the verifier checks, it can be either loaded into
 an interpreter (from [uBPF](https://github.com/iovisor/ubpf) in the kernel-mode execution context), or
 JIT compiled (via the [uBPF](https://github.com/iovisor/ubpf) JIT compiler) and have native code load
 into the kernel-mode execution context (but see the FAQ at bottom about HVCI).
 
-*Temporary Note: some parts are still under development and may not appear
-when building the master branch, but the end-to-end functionality can still be tested immediately
-while the security hardening is still in progress.*
-
 eBPF programs installed into the kernel-mode execution context can attach to various hooks (currently
-two hooks so far: an XDP-like hook that is based on the Windows Filtering Platform (WFP) [layer 2 filtering](https://docs.microsoft.com/en-us/windows-hardware/drivers/network/using-layer-2-filtering), and a socket bind hook) and call various helper APIs exposed by the eBPF shim,
+two hooks so far: an XDP hook that integrates with the Windows Filtering Platform (WFP) [layer 2 filtering](https://docs.microsoft.com/en-us/windows-hardware/drivers/network/using-layer-2-filtering), and a socket bind hook) and call various helper APIs exposed by the eBPF shim,
 which internally wraps public Windows kernel APIs, allowing the use of eBPF on existing versions of Windows.
-More hooks and helpers will be added over time.
+Many helpers already exist, and more hooks and helpers will be added over time.
 
 ## Getting Started
 
-This project supports eBPF on Windows 10, and on Windows Server 2016 or later.
+This project supports eBPF on Windows 10 or later, and on Windows Server 2019 or later.
 To try out this project, see our [Getting Started Guide](docs/GettingStarted.md).
 
 Want to help?  We welcome contributions!  See our [Contributing guidelines](CONTRIBUTING.md).
+Feel free to take a look at our [Good First Issues](https://github.com/microsoft/ebpf-for-windows/labels/good%20first%20issue)
+list if you're looking for somewhere to start.
 
 Want to chat with us?  We have a:
-* [Slack channel](https://slack.com/app_redirect?channel=ebpf-for-windows)
-* Zoom meeting for github issue triage: see [meeting info](https://github.com/microsoft/ebpf-for-windows/issues/162)
+* [Slack channel](https://cilium.slack.com/messages/ebpf-for-windows) (If you are new, sign up at http://slack.cilium.io/)
+* Zoom meeting for github issue triage: see [meeting info](https://github.com/microsoft/ebpf-for-windows/discussions/427)
+
+For tracking Q&A and general discussion, we use [Discussions](https://github.com/microsoft/ebpf-for-windows/discussions)
+in github.  This can also function similar to a mailing list if you subscribe to discussion notifications by
+clicking "Watch" (or "Unwatch") and selecting "Custom" -> "Discussions" (or by selecting "All Activity" if
+you want to receive notifications about everything else too).
 
 ## Frequently Asked Questions
 

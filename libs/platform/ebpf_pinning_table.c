@@ -1,9 +1,24 @@
 // Copyright (c) Microsoft Corporation
 // SPDX-License-Identifier: MIT
 
+// The pinning table stores ebpf_pinning_entry_t objects in an ebpf_hash_table_t, which is designed to store fixed
+// size keys and values. The pinning table uses ebpf_utf8_string_t as the key for this table, which is a variable
+// sized structure with embedded pointers. As a result, ebpf_utf8_string_t structures are not directly comparable.
+// To handle this case, the ebpf_hash_table_t exposes an extract method, that accepts a key and returns
+// a pointer to data that can be compared or hashed. The ebpf_hash_table_t is initialized to use ebpf_utf8_string_t*
+// as keys and ebpf_pinning_entry_t* as values.
+// Insertion - The key is a pointer to the ebpf_utf8_string_t embedded in the ebpf_pinning_entry_t and the value is
+// a pointer to the ebpf_pinning_entry_t object.
+// Find/Delete - The key is a pointer to an ebpf_utf8_string_t that contains the string to search for.
+// Find returns a pointer to the ebpf_pinning_entry_t object. Comparison is done based on the value pointed to by the
+// key. Delete erases the entry from the ebpf_hash_table_t, but doesn't free the memory associated with the
+// ebpf_pinning_entry_t.
+
+#include "ebpf_core_structs.h"
+#include "ebpf_object.h"
 #include "ebpf_pinning_table.h"
 
-#include "ebpf_object.h"
+#define EBPF_PINNING_TABLE_BUCKET_COUNT 64
 
 typedef struct _ebpf_pinning_table
 {
@@ -11,25 +26,12 @@ typedef struct _ebpf_pinning_table
     ebpf_lock_t lock;
 } ebpf_pinning_table_t;
 
-static ebpf_hash_table_compare_result_t
-_ebpf_pining_table_compare_function(const uint8_t* key1, const uint8_t* key2)
+static void
+_ebpf_pinning_table_extract(_In_ const uint8_t* value, _Outptr_ const uint8_t** data, _Out_ size_t* length)
 {
-    const ebpf_utf8_string_t* first_key = *(ebpf_utf8_string_t**)key1;
-    const ebpf_utf8_string_t* second_key = *(ebpf_utf8_string_t**)key2;
-    size_t min_length = min(first_key->length, second_key->length);
-
-    // Note: This is not a lexicographical sort order.
-    int compare_result = memcmp(first_key->value, second_key->value, min_length);
-    if (compare_result < 0)
-        return EBPF_HASH_TABLE_LESS_THAN;
-    else if (compare_result > 0)
-        return EBPF_HASH_TABLE_GREATER_THAN;
-    else if (first_key->length < second_key->length)
-        return EBPF_HASH_TABLE_LESS_THAN;
-    else if (first_key->length > second_key->length)
-        return EBPF_HASH_TABLE_GREATER_THAN;
-    else
-        return EBPF_HASH_TABLE_EQUAL;
+    const ebpf_utf8_string_t* key = *(ebpf_utf8_string_t**)value;
+    *data = key->value;
+    *length = key->length * 8;
 }
 
 static void
@@ -39,13 +41,14 @@ _ebpf_pinning_entry_free(ebpf_pinning_entry_t* pinning_entry)
         return;
     }
     ebpf_object_release_reference(pinning_entry->object);
-    ebpf_free(pinning_entry->name.value);
+    ebpf_free(pinning_entry->path.value);
     ebpf_free(pinning_entry);
 }
 
 ebpf_result_t
 ebpf_pinning_table_allocate(ebpf_pinning_table_t** pinning_table)
 {
+    EBPF_LOG_ENTRY();
     ebpf_result_t return_value;
     *pinning_table = ebpf_allocate(sizeof(ebpf_pinning_table_t));
     if (*pinning_table == NULL) {
@@ -63,7 +66,8 @@ ebpf_pinning_table_allocate(ebpf_pinning_table_t** pinning_table)
         ebpf_free,
         sizeof(ebpf_utf8_string_t*),
         sizeof(ebpf_pinning_entry_t*),
-        _ebpf_pining_table_compare_function);
+        EBPF_PINNING_TABLE_BUCKET_COUNT,
+        _ebpf_pinning_table_extract);
 
     if (return_value != EBPF_SUCCESS)
         goto Done;
@@ -77,14 +81,15 @@ Done:
         ebpf_free(*pinning_table);
     }
 
-    return return_value;
+    EBPF_RETURN_RESULT(return_value);
 }
 
 void
 ebpf_pinning_table_free(ebpf_pinning_table_t* pinning_table)
 {
+    EBPF_LOG_ENTRY();
     ebpf_result_t return_value;
-    ebpf_utf8_string_t* key;
+    ebpf_utf8_string_t* key = NULL;
 
     for (;;) {
         return_value = ebpf_hash_table_next_key(pinning_table->hash_table, NULL, (uint8_t*)&key);
@@ -96,17 +101,28 @@ ebpf_pinning_table_free(ebpf_pinning_table_t* pinning_table)
 
     ebpf_hash_table_destroy(pinning_table->hash_table);
     ebpf_free(pinning_table);
+    EBPF_RETURN_VOID();
 }
 
 ebpf_result_t
-ebpf_pinning_table_insert(ebpf_pinning_table_t* pinning_table, const ebpf_utf8_string_t* name, ebpf_object_t* object)
+ebpf_pinning_table_insert(ebpf_pinning_table_t* pinning_table, const ebpf_utf8_string_t* path, ebpf_object_t* object)
 {
+    EBPF_LOG_ENTRY();
     ebpf_lock_state_t state;
     ebpf_result_t return_value;
     ebpf_utf8_string_t* new_key;
     ebpf_pinning_entry_t* new_pinning_entry;
-    const ebpf_utf8_string_t* existing_key = name;
-    ebpf_pinning_entry_t** existing_pinning_entry;
+
+    if (path->length >= EBPF_MAX_PIN_PATH_LENGTH || path->length == 0) {
+        EBPF_RETURN_RESULT(EBPF_INVALID_ARGUMENT);
+    }
+
+    // Block embedded null terminators
+    for (size_t index = 0; index < path->length; index++) {
+        if (path->value[index] == 0) {
+            EBPF_RETURN_RESULT(EBPF_INVALID_ARGUMENT);
+        }
+    }
 
     new_pinning_entry = ebpf_allocate(sizeof(ebpf_pinning_entry_t));
     if (!new_pinning_entry) {
@@ -114,41 +130,46 @@ ebpf_pinning_table_insert(ebpf_pinning_table_t* pinning_table, const ebpf_utf8_s
         goto Done;
     }
 
-    return_value = ebpf_duplicate_utf8_string(&new_pinning_entry->name, name);
+    return_value = ebpf_duplicate_utf8_string(&new_pinning_entry->path, path);
     if (return_value != EBPF_SUCCESS)
         goto Done;
 
     new_pinning_entry->object = object;
     ebpf_object_acquire_reference(object);
-    new_key = &new_pinning_entry->name;
+    new_key = &new_pinning_entry->path;
 
     state = ebpf_lock_lock(&pinning_table->lock);
 
-    return_value = ebpf_hash_table_find(
-        pinning_table->hash_table, (const uint8_t*)&existing_key, (uint8_t**)&existing_pinning_entry);
-    if (return_value == EBPF_SUCCESS) {
+    return_value = ebpf_hash_table_update(
+        pinning_table->hash_table,
+        (const uint8_t*)&new_key,
+        (const uint8_t*)&new_pinning_entry,
+        EBPF_HASH_TABLE_OPERATION_INSERT);
+    if (return_value == EBPF_KEY_ALREADY_EXISTS) {
         return_value = EBPF_OBJECT_ALREADY_EXISTS;
-    } else {
-        return_value = ebpf_hash_table_update(
-            pinning_table->hash_table, (const uint8_t*)&new_key, (const uint8_t*)&new_pinning_entry);
-        if (return_value == EBPF_SUCCESS)
-            new_pinning_entry = NULL;
+    } else if (return_value == EBPF_SUCCESS) {
+        new_pinning_entry = NULL;
+        object->pinned_path_count++;
     }
 
     ebpf_lock_unlock(&pinning_table->lock, state);
 
 Done:
     _ebpf_pinning_entry_free(new_pinning_entry);
+    if (return_value == EBPF_SUCCESS) {
+        EBPF_LOG_MESSAGE_UTF8_STRING(EBPF_TRACELOG_LEVEL_VERBOSE, EBPF_TRACELOG_KEYWORD_BASE, "Pinned object", *path);
+    }
 
-    return return_value;
+    EBPF_RETURN_RESULT(return_value);
 }
 
 ebpf_result_t
-ebpf_pinning_table_find(ebpf_pinning_table_t* pinning_table, const ebpf_utf8_string_t* name, ebpf_object_t** object)
+ebpf_pinning_table_find(ebpf_pinning_table_t* pinning_table, const ebpf_utf8_string_t* path, ebpf_object_t** object)
 {
+    EBPF_LOG_ENTRY();
     ebpf_lock_state_t state;
     ebpf_result_t return_value;
-    const ebpf_utf8_string_t* existing_key = name;
+    const ebpf_utf8_string_t* existing_key = path;
     ebpf_pinning_entry_t** existing_pinning_entry;
 
     state = ebpf_lock_lock(&pinning_table->lock);
@@ -162,15 +183,16 @@ ebpf_pinning_table_find(ebpf_pinning_table_t* pinning_table, const ebpf_utf8_str
 
     ebpf_lock_unlock(&pinning_table->lock, state);
 
-    return return_value;
+    EBPF_RETURN_RESULT(return_value);
 }
 
 ebpf_result_t
-ebpf_pinning_table_delete(ebpf_pinning_table_t* pinning_table, const ebpf_utf8_string_t* name)
+ebpf_pinning_table_delete(ebpf_pinning_table_t* pinning_table, const ebpf_utf8_string_t* path)
 {
+    EBPF_LOG_ENTRY();
     ebpf_lock_state_t state;
     ebpf_result_t return_value;
-    const ebpf_utf8_string_t* existing_key = name;
+    const ebpf_utf8_string_t* existing_key = path;
     ebpf_pinning_entry_t** existing_pinning_entry;
 
     state = ebpf_lock_lock(&pinning_table->lock);
@@ -178,13 +200,18 @@ ebpf_pinning_table_delete(ebpf_pinning_table_t* pinning_table, const ebpf_utf8_s
         pinning_table->hash_table, (const uint8_t*)&existing_key, (uint8_t**)&existing_pinning_entry);
     if (return_value == EBPF_SUCCESS) {
         ebpf_pinning_entry_t* entry = *existing_pinning_entry;
-        // Note: Can't fail because we first checked the entry exists.
-        ebpf_hash_table_delete(pinning_table->hash_table, (const uint8_t*)&existing_key);
-        _ebpf_pinning_entry_free(entry);
+        return_value = ebpf_hash_table_delete(pinning_table->hash_table, (const uint8_t*)&existing_key);
+        if (return_value == EBPF_SUCCESS) {
+            entry->object->pinned_path_count--;
+            _ebpf_pinning_entry_free(entry);
+        }
     }
     ebpf_lock_unlock(&pinning_table->lock, state);
 
-    return return_value;
+    if (return_value == EBPF_SUCCESS) {
+        EBPF_LOG_MESSAGE_UTF8_STRING(EBPF_TRACELOG_LEVEL_VERBOSE, EBPF_TRACELOG_KEYWORD_BASE, "Unpinned object", *path);
+    }
+    EBPF_RETURN_RESULT(return_value);
 }
 
 ebpf_result_t
@@ -194,13 +221,14 @@ ebpf_pinning_table_enumerate_entries(
     _Out_ uint16_t* entry_count,
     _Outptr_result_buffer_maybenull_(*entry_count) ebpf_pinning_entry_t** pinning_entries)
 {
+    EBPF_LOG_ENTRY();
     ebpf_result_t result = EBPF_SUCCESS;
     ebpf_lock_state_t state = 0;
     bool lock_held = FALSE;
     uint16_t local_entry_count = 0;
     uint16_t entries_array_length = 0;
     ebpf_pinning_entry_t* local_pinning_entries = NULL;
-    ebpf_utf8_string_t* next_object_name;
+    ebpf_utf8_string_t* next_object_path;
     ebpf_pinning_entry_t* new_entry = NULL;
 
     if ((entry_count == NULL) || (pinning_entries == NULL)) {
@@ -226,15 +254,15 @@ ebpf_pinning_table_enumerate_entries(
     }
 
     // Loop through the entries in the hashtable.
-    next_object_name = NULL;
+    next_object_path = NULL;
     for (;;) {
         ebpf_pinning_entry_t** next_pinning_entry = NULL;
 
         // Find next pinning entry, if any.
         result = ebpf_hash_table_next_key_and_value(
             pinning_table->hash_table,
-            (const uint8_t*)((next_object_name == NULL) ? NULL : &next_object_name),
-            (uint8_t*)&next_object_name,
+            (const uint8_t*)((next_object_path == NULL) ? NULL : &next_object_path),
+            (uint8_t*)&next_object_path,
             (uint8_t**)&next_pinning_entry);
 
         if (result == EBPF_NO_MORE_KEYS) {
@@ -261,8 +289,8 @@ ebpf_pinning_table_enumerate_entries(
         // Take reference on underlying ebpf_object.
         ebpf_object_acquire_reference(new_entry->object);
 
-        // Duplicate pinning object name.
-        result = ebpf_duplicate_utf8_string(&new_entry->name, &(*next_pinning_entry)->name);
+        // Duplicate pinning object path.
+        result = ebpf_duplicate_utf8_string(&new_entry->path, &(*next_pinning_entry)->path);
         if (result != EBPF_SUCCESS)
             goto Exit;
     }
@@ -282,21 +310,69 @@ Exit:
     *entry_count = local_entry_count;
     *pinning_entries = local_pinning_entries;
 
-    return result;
+    EBPF_RETURN_RESULT(result);
+}
+
+ebpf_result_t
+ebpf_pinning_table_get_next_path(
+    _In_ ebpf_pinning_table_t* pinning_table,
+    ebpf_object_type_t object_type,
+    _In_ const ebpf_utf8_string_t* start_path,
+    _Inout_ ebpf_utf8_string_t* next_path)
+{
+    EBPF_LOG_ENTRY();
+    if ((pinning_table == NULL) || (start_path == NULL) || (next_path == NULL)) {
+        EBPF_RETURN_RESULT(EBPF_INVALID_ARGUMENT);
+    }
+
+    const uint8_t* previous_key = (start_path->length == 0) ? NULL : (const uint8_t*)&start_path;
+
+    ebpf_lock_state_t state = ebpf_lock_lock(&pinning_table->lock);
+
+    ebpf_result_t result;
+    ebpf_pinning_entry_t** next_pinning_entry = NULL;
+
+    for (;;) {
+        // Get the next entry in the table.
+        ebpf_utf8_string_t* next_object_path;
+        result = ebpf_hash_table_next_key_and_value(
+            pinning_table->hash_table, previous_key, (uint8_t*)&next_object_path, (uint8_t**)&next_pinning_entry);
+        if (result != EBPF_SUCCESS) {
+            break;
+        }
+
+        // See if the entry matches the object type the caller is interested in.
+        if (object_type == ebpf_object_get_type((*next_pinning_entry)->object)) {
+            if (next_path->length < (*next_pinning_entry)->path.length) {
+                result = EBPF_INSUFFICIENT_BUFFER;
+            } else {
+                next_path->length = (*next_pinning_entry)->path.length;
+                memcpy(next_path->value, (*next_pinning_entry)->path.value, next_path->length);
+                result = EBPF_SUCCESS;
+            }
+            break;
+        }
+        previous_key = (uint8_t*)&next_object_path;
+    }
+
+    ebpf_lock_unlock(&pinning_table->lock, state);
+    EBPF_RETURN_RESULT(result);
 }
 
 void
 ebpf_pinning_entries_release(uint16_t entry_count, _In_opt_count_(entry_count) ebpf_pinning_entry_t* pinning_entries)
 {
+    EBPF_LOG_ENTRY();
     uint16_t index;
     if (!pinning_entries)
-        return;
+        EBPF_RETURN_VOID();
 
     for (index = 0; index < entry_count; index++) {
         ebpf_pinning_entry_t* entry = &pinning_entries[index];
-        ebpf_free(entry->name.value);
-        entry->name.value = NULL;
+        ebpf_free(entry->path.value);
+        entry->path.value = NULL;
         ebpf_object_release_reference(entry->object);
     }
     ebpf_free(pinning_entries);
+    EBPF_RETURN_VOID();
 }

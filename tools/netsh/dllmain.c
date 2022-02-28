@@ -9,10 +9,11 @@
 #include <stdlib.h>
 #include "ebpf_api.h"
 #include "elf.h"
+#include "links.h"
+#include "maps.h"
+#include "pins.h"
 #include "programs.h"
 #include "resource.h"
-
-DWORD g_ApiDllInitialized = ERROR_SUCCESS;
 
 static const GUID g_EbpfHelperGuid = {/* 634d21b8-13f9-46a3-945f-885cbd661c13 */
                                       0x634d21b8,
@@ -36,12 +37,17 @@ DllMain(HMODULE moduleHandle, DWORD reasonForCall, void* reserved)
 #define CMD_GROUP_SHOW L"show"
 
 // Nouns
+#define CMD_EBPF_SHOW_DISASSEMBLY L"disassembly"
+#define CMD_EBPF_SHOW_LINKS L"links"
+#define CMD_EBPF_SHOW_MAPS L"maps"
+#define CMD_EBPF_SHOW_PINS L"pins"
+
 #define CMD_EBPF_ADD_PROGRAM L"program"
 #define CMD_EBPF_DELETE_PROGRAM L"program"
 #define CMD_EBPF_SET_PROGRAM L"program"
 #define CMD_EBPF_SHOW_PROGRAMS L"programs"
+
 #define CMD_EBPF_SHOW_SECTIONS L"sections"
-#define CMD_EBPF_SHOW_DISASSEMBLY L"disassembly"
 #define CMD_EBPF_SHOW_VERIFICATION L"verification"
 
 CMD_ENTRY g_EbpfAddCommandTable[] = {
@@ -55,6 +61,9 @@ CMD_ENTRY g_EbpfSetCommandTable[] = {
 };
 CMD_ENTRY g_EbpfShowCommandTable[] = {
     CREATE_CMD_ENTRY(EBPF_SHOW_DISASSEMBLY, handle_ebpf_show_disassembly),
+    CREATE_CMD_ENTRY(EBPF_SHOW_LINKS, handle_ebpf_show_links),
+    CREATE_CMD_ENTRY(EBPF_SHOW_MAPS, handle_ebpf_show_maps),
+    CREATE_CMD_ENTRY(EBPF_SHOW_PINS, handle_ebpf_show_pins),
     CREATE_CMD_ENTRY(EBPF_SHOW_PROGRAMS, handle_ebpf_show_programs),
     CREATE_CMD_ENTRY(EBPF_SHOW_SECTIONS, handle_ebpf_show_sections),
     CREATE_CMD_ENTRY(EBPF_SHOW_VERIFICATION, handle_ebpf_show_verification),
@@ -105,12 +114,6 @@ __declspec(dllexport) DWORD InitHelperDll(DWORD netshVersion, void* reserved)
     attributes.pfnStart = EbpfStartHelper;
 
     DWORD status = RegisterHelper(NULL, &attributes);
-
-    if (status == ERROR_SUCCESS) {
-        // Allow for this to fail since some commands currently
-        // don't require the ebpf_api.
-        g_ApiDllInitialized = ebpf_api_initiate();
-    }
 
     return status;
 }

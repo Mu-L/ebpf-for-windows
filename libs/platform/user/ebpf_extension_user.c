@@ -3,9 +3,12 @@
 
 #include "ebpf_platform.h"
 
+#define EBPF_EXTENSION_TABLE_BUCKET_COUNT 64
+
 typedef struct _ebpf_extension_client
 {
-    GUID client_id;
+    GUID npi_id;
+    GUID client_module_id;
     GUID interface_id;
     void* extension_client_context;
     const ebpf_extension_data_t* client_data;
@@ -15,6 +18,7 @@ typedef struct _ebpf_extension_client
 typedef struct _ebpf_extension_provider
 {
     GUID interface_id;
+    GUID provider_module_id;
     void* provider_binding_context;
     const ebpf_extension_data_t* provider_data;
     const ebpf_extension_dispatch_table_t* provider_dispatch_table;
@@ -31,6 +35,7 @@ ebpf_result_t
 ebpf_extension_load(
     _Outptr_ ebpf_extension_client_t** client_context,
     _In_ const GUID* interface_id,
+    _In_ const GUID* client_module_id,
     _In_ void* extension_client_context,
     _In_opt_ const ebpf_extension_data_t* client_data,
     _In_opt_ const ebpf_extension_dispatch_table_t* client_dispatch_table,
@@ -39,13 +44,12 @@ ebpf_extension_load(
     _Outptr_opt_ const ebpf_extension_dispatch_table_t** provider_dispatch_table,
     _In_opt_ ebpf_extension_change_callback_t extension_changed)
 {
+    EBPF_LOG_ENTRY();
     ebpf_result_t return_value;
     ebpf_lock_state_t state = 0;
     ebpf_extension_provider_t* local_extension_provider = NULL;
     ebpf_extension_provider_t** hash_table_find_result = NULL;
     ebpf_extension_client_t* local_extension_client = NULL;
-
-    UNREFERENCED_PARAMETER(extension_changed);
 
     state = ebpf_lock_lock(&_ebpf_provider_table_lock);
 
@@ -71,11 +75,13 @@ ebpf_extension_load(
     local_extension_client->client_dispatch_table = client_dispatch_table;
     local_extension_client->interface_id = *interface_id;
 
-    ebpf_guid_create(&local_extension_client->client_id);
+    local_extension_client->client_module_id = *client_module_id;
 
     return_value =
         ebpf_hash_table_find(_ebpf_provider_table, (const uint8_t*)interface_id, (uint8_t**)&hash_table_find_result);
     if (return_value != EBPF_SUCCESS) {
+        EBPF_LOG_MESSAGE_GUID(
+            EBPF_TRACELOG_LEVEL_ERROR, EBPF_TRACELOG_KEYWORD_BASE, "Provider not found", *interface_id);
         return_value = EBPF_INVALID_ARGUMENT;
         goto Done;
     }
@@ -83,16 +89,19 @@ ebpf_extension_load(
 
     return_value = ebpf_hash_table_update(
         local_extension_provider->client_table,
-        (const uint8_t*)&local_extension_client->client_id,
-        (const uint8_t*)&local_extension_client);
+        (const uint8_t*)&local_extension_client->client_module_id,
+        (const uint8_t*)&local_extension_client,
+        EBPF_HASH_TABLE_OPERATION_INSERT);
     if (return_value != EBPF_SUCCESS) {
+        EBPF_LOG_MESSAGE_UINT64(
+            EBPF_TRACELOG_LEVEL_ERROR, EBPF_TRACELOG_KEYWORD_BASE, "ebpf_hash_table_update failed", return_value);
         goto Done;
     }
 
     if (local_extension_provider->client_attach_callback) {
         return_value = local_extension_provider->client_attach_callback(
             local_extension_provider->callback_context,
-            &local_extension_client->client_id,
+            &local_extension_client->client_module_id,
             local_extension_client,
             client_data,
             client_dispatch_table);
@@ -110,26 +119,31 @@ ebpf_extension_load(
     if (provider_dispatch_table != NULL)
         *provider_dispatch_table = local_extension_provider->provider_dispatch_table;
 
+    // Invoke extension changed on client.
+    if ((extension_changed != NULL) && (provider_data != NULL))
+        extension_changed(extension_client_context, provider_binding_context, *provider_data);
+
 Done:
     if (local_extension_provider && local_extension_client) {
         ebpf_hash_table_delete(
-            local_extension_provider->client_table, (const uint8_t*)&local_extension_client->client_id);
+            local_extension_provider->client_table, (const uint8_t*)&local_extension_client->client_module_id);
     }
 
     ebpf_lock_unlock(&_ebpf_provider_table_lock, state);
-    return return_value;
+    EBPF_RETURN_RESULT(return_value);
 }
 
 void
 ebpf_extension_unload(_Frees_ptr_opt_ ebpf_extension_client_t* client_context)
 {
+    EBPF_LOG_ENTRY();
     ebpf_result_t return_value;
     ebpf_lock_state_t state;
     ebpf_extension_provider_t** hash_table_find_result = NULL;
     ebpf_extension_provider_t* local_extension_provider = NULL;
 
     if (!client_context)
-        return;
+        EBPF_RETURN_VOID();
 
     state = ebpf_lock_lock(&_ebpf_provider_table_lock);
 
@@ -146,13 +160,14 @@ ebpf_extension_unload(_Frees_ptr_opt_ ebpf_extension_client_t* client_context)
 
     if (local_extension_provider->client_detach_callback) {
         local_extension_provider->client_detach_callback(
-            local_extension_provider->callback_context, &client_context->client_id);
+            local_extension_provider->callback_context, &client_context->client_module_id);
     }
-    ebpf_hash_table_delete(local_extension_provider->client_table, (const uint8_t*)&client_context->client_id);
+    ebpf_hash_table_delete(local_extension_provider->client_table, (const uint8_t*)&client_context->client_module_id);
 
 Done:
     ebpf_free(client_context);
     ebpf_lock_unlock(&_ebpf_provider_table_lock, state);
+    EBPF_RETURN_VOID();
 }
 
 void*
@@ -166,12 +181,20 @@ ebpf_extension_get_client_context(_In_ const void* extension_client_binding_cont
     return local_extension_client_context;
 }
 
+GUID
+ebpf_extension_get_provider_guid(_In_ const void* extension_client_binding_context)
+{
+    ebpf_extension_client_t* local_client_context = (ebpf_extension_client_t*)extension_client_binding_context;
+    return local_client_context->npi_id;
+}
+
 #pragma warning(push)
 #pragma warning(disable : 6101) // ebpf_free at exit
 ebpf_result_t
 ebpf_provider_load(
     _Outptr_ ebpf_extension_provider_t** provider_context,
     _In_ const GUID* interface_id,
+    _In_ const GUID* provider_module_id,
     _In_opt_ void* provider_binding_context,
     _In_opt_ const ebpf_extension_data_t* provider_data,
     _In_opt_ const ebpf_extension_dispatch_table_t* provider_dispatch_table,
@@ -179,14 +202,21 @@ ebpf_provider_load(
     _In_opt_ ebpf_provider_client_attach_callback_t client_attach_callback,
     _In_opt_ ebpf_provider_client_detach_callback_t client_detach_callback)
 {
+    EBPF_LOG_ENTRY();
     ebpf_result_t return_value;
     ebpf_lock_state_t state;
     ebpf_extension_provider_t* local_extension_provider = NULL;
     state = ebpf_lock_lock(&_ebpf_provider_table_lock);
 
     if (!_ebpf_provider_table) {
-        return_value =
-            ebpf_hash_table_create(&_ebpf_provider_table, ebpf_allocate, ebpf_free, sizeof(GUID), sizeof(void*), NULL);
+        return_value = ebpf_hash_table_create(
+            &_ebpf_provider_table,
+            ebpf_allocate,
+            ebpf_free,
+            sizeof(GUID),
+            sizeof(void*),
+            EBPF_EXTENSION_TABLE_BUCKET_COUNT,
+            NULL);
         if (return_value != EBPF_SUCCESS)
             goto Done;
     }
@@ -195,6 +225,9 @@ ebpf_provider_load(
         ebpf_hash_table_find(_ebpf_provider_table, (const uint8_t*)interface_id, (uint8_t**)&local_extension_provider);
     if (return_value == EBPF_SUCCESS) {
         return_value = EBPF_OBJECT_ALREADY_EXISTS;
+        EBPF_LOG_MESSAGE_GUID(
+            EBPF_TRACELOG_LEVEL_ERROR, EBPF_TRACELOG_KEYWORD_BASE, "Provider already loaded", *interface_id);
+
         local_extension_provider = NULL;
         goto Done;
     }
@@ -207,6 +240,7 @@ ebpf_provider_load(
     memset(local_extension_provider, 0, sizeof(ebpf_extension_provider_t));
 
     local_extension_provider->interface_id = *interface_id;
+    local_extension_provider->provider_module_id = *provider_module_id;
     local_extension_provider->provider_binding_context = provider_binding_context;
     local_extension_provider->provider_data = provider_data;
     local_extension_provider->provider_dispatch_table = provider_dispatch_table;
@@ -215,13 +249,22 @@ ebpf_provider_load(
     local_extension_provider->client_detach_callback = client_detach_callback;
 
     return_value = ebpf_hash_table_create(
-        &local_extension_provider->client_table, ebpf_allocate, ebpf_free, sizeof(GUID), sizeof(void*), NULL);
+        &local_extension_provider->client_table,
+        ebpf_allocate,
+        ebpf_free,
+        sizeof(GUID),
+        sizeof(void*),
+        EBPF_EXTENSION_TABLE_BUCKET_COUNT,
+        NULL);
     if (return_value != EBPF_SUCCESS) {
         goto Done;
     }
 
     return_value = ebpf_hash_table_update(
-        _ebpf_provider_table, (const uint8_t*)interface_id, (const uint8_t*)&local_extension_provider);
+        _ebpf_provider_table,
+        (const uint8_t*)interface_id,
+        (const uint8_t*)&local_extension_provider,
+        EBPF_HASH_TABLE_OPERATION_INSERT);
     if (return_value != EBPF_SUCCESS)
         goto Done;
 
@@ -231,20 +274,21 @@ ebpf_provider_load(
 Done:
     ebpf_lock_unlock(&_ebpf_provider_table_lock, state);
     ebpf_free(local_extension_provider);
-    return return_value;
+    EBPF_RETURN_RESULT(return_value);
 }
 #pragma warning(pop)
 
 void
 ebpf_provider_unload(_Frees_ptr_opt_ ebpf_extension_provider_t* provider_context)
 {
+    EBPF_LOG_ENTRY();
     ebpf_result_t return_value;
     ebpf_lock_state_t state;
     ebpf_extension_provider_t* local_extension_provider = NULL;
     GUID next_key;
 
     if (!provider_context)
-        return;
+        EBPF_RETURN_VOID();
 
     state = ebpf_lock_lock(&_ebpf_provider_table_lock);
 
@@ -263,4 +307,5 @@ ebpf_provider_unload(_Frees_ptr_opt_ ebpf_extension_provider_t* provider_context
 Done:
     ebpf_lock_unlock(&_ebpf_provider_table_lock, state);
     ebpf_free(local_extension_provider);
+    EBPF_RETURN_VOID();
 }

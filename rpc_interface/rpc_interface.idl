@@ -31,16 +31,22 @@ import "wtypes.idl";
 
         typedef[system_handle(sh_file)] HANDLE file_handle_t;
 
-        typedef struct _fd_handle_map
+        typedef struct _original_fd_handle_map
         {
-            uint32_t file_descriptor;
+            // Original fd as it appears in the eBPF byte code.
+            uint32_t original_fd;
+
+            // Inner map's original fd.
+            uint32_t inner_map_original_fd;
+
+            // Handle from which the rest of the data can be looked up.
             file_handle_t handle;
-        } fd_handle_map;
+        } original_fd_handle_map_t;
 
         typedef struct _ebpf_program_load_info
         {
-            // Optional file name.
-            [string] char* file_name;
+            // Object name.
+            [string] char* object_name;
             // Optional section name.
             [string] char* section_name;
             // Optional program name.
@@ -50,7 +56,7 @@ import "wtypes.idl";
             file_handle_t program_handle;
             ebpf_execution_context_t execution_context;
             uint32_t map_count;
-            [size_is(map_count)] fd_handle_map* handle_map;
+            [size_is(map_count)] original_fd_handle_map_t* handle_map;
             uint32_t byte_code_size;
             [ size_is(byte_code_size), ref ] uint8_t* byte_code;
         } ebpf_program_load_info;
@@ -70,8 +76,9 @@ import "wtypes.idl";
             [ out, ref ] uint32_t * logs_size,
             [ out, size_is(, *logs_size), ref ] char** logs);
 
-        ebpf_result_t verify_program(
-            [ in, ref ] ebpf_program_verify_info * info,
-            [out] uint32_t * logs_size,
-            [ out, size_is(, *logs_size), ref ] char** logs);
+        ebpf_result_t verify_program([ in, ref ] ebpf_program_verify_info * info, [out] uint32_t * logs_size, [
+            out,
+            size_is(, *logs_size),
+            ref
+        ] char** logs);
     }

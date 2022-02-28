@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <vector>
+#include <TraceLoggingProvider.h>
 
 // Global variables used to override behavior for testing.
 // Permit the test to simulate both Hyper-V Code Integrity.
@@ -17,74 +18,9 @@ bool _ebpf_platform_code_integrity_enabled = false;
 // Permit the test to simulate non-preemptible execution.
 bool _ebpf_platform_is_preemptible = true;
 
-void (*RtlInitializeGenericTableAvl)(
-    _Out_ PRTL_AVL_TABLE Table,
-    _In_ PRTL_AVL_COMPARE_ROUTINE CompareRoutine,
-    _In_ PRTL_AVL_ALLOCATE_ROUTINE AllocateRoutine,
-    _In_ PRTL_AVL_FREE_ROUTINE FreeRoutine,
-    _In_opt_ PVOID TableContext);
-
-void* (*RtlEnumerateGenericTableAvl)(_In_ PRTL_AVL_TABLE Table, _In_ BOOLEAN Restart);
-
-BOOLEAN (*RtlDeleteElementGenericTableAvl)(_In_ PRTL_AVL_TABLE Table, _In_ PVOID Buffer);
-
-void* (*RtlLookupElementGenericTableAvl)(_In_ PRTL_AVL_TABLE Table, _In_ PVOID Buffer);
-
-void* (*RtlInsertElementGenericTableAvl)(
-    _In_ PRTL_AVL_TABLE Table,
-    _In_reads_bytes_(BufferSize) PVOID Buffer,
-    _In_ const uint32_t BufferSize,
-    _Out_opt_ PBOOLEAN NewElement);
-
-PVOID(*RtlLookupFirstMatchingElementGenericTableAvl)
-(_In_ PRTL_AVL_TABLE Table, _In_ PVOID Buffer, _Out_ PVOID* RestartKey);
-
-template <typename fn>
-bool
-resolve_function(HMODULE module_handle, fn& function, const char* function_name)
-{
-    function = reinterpret_cast<fn>(GetProcAddress(module_handle, function_name));
-    return (function != nullptr);
-}
-
 ebpf_result_t
 ebpf_platform_initiate()
 {
-    HMODULE ntdll_module = nullptr;
-
-    ntdll_module = LoadLibrary(L"ntdll.dll");
-    if (ntdll_module == nullptr) {
-        return EBPF_OPERATION_NOT_SUPPORTED;
-    }
-
-    if (!resolve_function(ntdll_module, RtlInitializeGenericTableAvl, "RtlInitializeGenericTableAvl")) {
-        return EBPF_OPERATION_NOT_SUPPORTED;
-    }
-    if (!resolve_function(ntdll_module, RtlEnumerateGenericTableAvl, "RtlEnumerateGenericTableAvl")) {
-        return EBPF_OPERATION_NOT_SUPPORTED;
-    }
-    if (!resolve_function(ntdll_module, RtlDeleteElementGenericTableAvl, "RtlDeleteElementGenericTableAvl")) {
-        return EBPF_OPERATION_NOT_SUPPORTED;
-    }
-    if (!resolve_function(ntdll_module, RtlLookupElementGenericTableAvl, "RtlLookupElementGenericTableAvl")) {
-        return EBPF_OPERATION_NOT_SUPPORTED;
-    }
-    if (!resolve_function(ntdll_module, RtlEnumerateGenericTableAvl, "RtlEnumerateGenericTableAvl")) {
-        return EBPF_OPERATION_NOT_SUPPORTED;
-    }
-    if (!resolve_function(
-            ntdll_module,
-            RtlLookupFirstMatchingElementGenericTableAvl,
-            "RtlLookupFirstMatchingElementGenericTableAvl")) {
-        return EBPF_OPERATION_NOT_SUPPORTED;
-    }
-    if (!resolve_function(ntdll_module, RtlInsertElementGenericTableAvl, "RtlInsertElementGenericTableAvl")) {
-        return EBPF_OPERATION_NOT_SUPPORTED;
-    }
-
-    // Note: This is safe because ntdll is never unloaded becuase
-    // ntdll.dll houses the module loader, which cannot unload itself.
-    FreeLibrary(ntdll_module);
     return EBPF_SUCCESS;
 }
 
@@ -95,12 +31,15 @@ ebpf_platform_terminate()
 ebpf_result_t
 ebpf_get_code_integrity_state(_Out_ ebpf_code_integrity_state_t* state)
 {
+    EBPF_LOG_ENTRY();
     if (_ebpf_platform_code_integrity_enabled) {
-        *state = EBPF_CODE_INTEGRITY_HYPER_VISOR_KERNEL_MODE;
+        EBPF_LOG_MESSAGE(EBPF_TRACELOG_LEVEL_INFO, EBPF_TRACELOG_KEYWORD_BASE, "Code integrity enabled");
+        *state = EBPF_CODE_INTEGRITY_HYPERVISOR_KERNEL_MODE;
     } else {
+        EBPF_LOG_MESSAGE(EBPF_TRACELOG_LEVEL_INFO, EBPF_TRACELOG_KEYWORD_BASE, "Code integrity disabled");
         *state = EBPF_CODE_INTEGRITY_DEFAULT;
     }
-    return EBPF_SUCCESS;
+    EBPF_RETURN_RESULT(EBPF_SUCCESS);
 }
 
 __drv_allocatesMem(Mem) _Must_inspect_result_ _Ret_maybenull_
@@ -114,10 +53,36 @@ __drv_allocatesMem(Mem) _Must_inspect_result_ _Ret_maybenull_
     return memory;
 }
 
+__drv_allocatesMem(Mem) _Must_inspect_result_ _Ret_maybenull_
+    _Post_writable_byte_size_(new_size) void* ebpf_reallocate(_In_ void* memory, size_t old_size, size_t new_size)
+{
+    UNREFERENCED_PARAMETER(old_size);
+    void* p = realloc(memory, new_size);
+    if (p && (new_size > old_size))
+        memset(((char*)p) + old_size, 0, new_size - old_size);
+    return p;
+}
+
 void
 ebpf_free(_Frees_ptr_opt_ void* memory)
 {
     free(memory);
+}
+
+__drv_allocatesMem(Mem) _Must_inspect_result_ _Ret_maybenull_
+    _Post_writable_byte_size_(size) void* ebpf_allocate_cache_aligned(size_t size)
+{
+    void* memory = _aligned_malloc(size, EBPF_CACHE_LINE_SIZE);
+    if (memory) {
+        memset(memory, 0, size);
+    }
+    return memory;
+}
+
+void
+ebpf_free_cache_aligned(_Frees_ptr_opt_ void* memory)
+{
+    _aligned_free(memory);
 }
 
 struct _ebpf_memory_descriptor
@@ -126,6 +91,14 @@ struct _ebpf_memory_descriptor
     size_t length;
 };
 typedef struct _ebpf_memory_descriptor ebpf_memory_descriptor_t;
+
+struct _ebpf_ring_descriptor
+{
+    void* primary_view;
+    void* secondary_view;
+    size_t length;
+};
+typedef struct _ebpf_ring_descriptor ebpf_ring_descriptor_t;
 
 ebpf_memory_descriptor_t*
 ebpf_map_memory(size_t length)
@@ -139,6 +112,7 @@ ebpf_map_memory(size_t length)
     descriptor->length = length;
 
     if (!descriptor->base) {
+        EBPF_LOG_WIN32_API_FAILURE(EBPF_TRACELOG_KEYWORD_BASE, VirtualAlloc);
         free(descriptor);
         descriptor = nullptr;
     }
@@ -149,14 +123,181 @@ void
 ebpf_unmap_memory(_Frees_ptr_opt_ ebpf_memory_descriptor_t* memory_descriptor)
 {
     if (memory_descriptor) {
-        VirtualFree(memory_descriptor->base, 0, MEM_RELEASE);
+        if (!VirtualFree(memory_descriptor->base, 0, MEM_RELEASE)) {
+            EBPF_LOG_WIN32_API_FAILURE(EBPF_TRACELOG_KEYWORD_BASE, VirtualFree);
+        }
         free(memory_descriptor);
     }
+}
+
+// This code is derived from the sample at:
+// https://docs.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualalloc2
+
+_Ret_maybenull_ ebpf_ring_descriptor_t*
+ebpf_allocate_ring_buffer_memory(size_t length)
+{
+    EBPF_LOG_ENTRY();
+    bool result = false;
+    HANDLE section = nullptr;
+    SYSTEM_INFO sysInfo;
+    uint8_t* placeholder1 = nullptr;
+    uint8_t* placeholder2 = nullptr;
+    void* view1 = nullptr;
+    void* view2 = nullptr;
+
+    GetSystemInfo(&sysInfo);
+
+    if (length == 0) {
+        EBPF_LOG_MESSAGE(EBPF_TRACELOG_LEVEL_ERROR, EBPF_TRACELOG_KEYWORD_BASE, "Ring buffer length is zero");
+        return nullptr;
+    }
+
+    if ((length % sysInfo.dwAllocationGranularity) != 0) {
+        EBPF_LOG_MESSAGE_UINT64(
+            EBPF_TRACELOG_LEVEL_ERROR,
+            EBPF_TRACELOG_KEYWORD_BASE,
+            "Ring buffer length doesn't match allocation granularity",
+            length);
+        return nullptr;
+    }
+
+    ebpf_ring_descriptor_t* descriptor = (ebpf_ring_descriptor_t*)ebpf_allocate(sizeof(ebpf_ring_descriptor_t));
+    if (!descriptor) {
+        goto Exit;
+    }
+    descriptor->length = length;
+
+    //
+    // Reserve a placeholder region where the buffer will be mapped.
+    //
+    placeholder1 = reinterpret_cast<uint8_t*>(
+        VirtualAlloc2(nullptr, nullptr, 2 * length, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0));
+
+    if (placeholder1 == nullptr) {
+        EBPF_LOG_WIN32_API_FAILURE(EBPF_TRACELOG_KEYWORD_BASE, VirtualAlloc2);
+        goto Exit;
+    }
+
+#pragma warning(push)
+#pragma warning(disable : 6333)  // Invalid parameter:  passing MEM_RELEASE and a non-zero dwSize parameter to
+                                 // 'VirtualFree' is not allowed.  This causes the call to fail.
+#pragma warning(disable : 28160) // Passing MEM_RELEASE and a non-zero dwSize parameter to VirtualFree is not allowed.
+                                 // This results in the failure of this call.
+    //
+    // Split the placeholder region into two regions of equal size.
+    //
+    result = VirtualFree(placeholder1, length, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+    if (result == FALSE) {
+        EBPF_LOG_WIN32_API_FAILURE(EBPF_TRACELOG_KEYWORD_BASE, VirtualFree);
+        goto Exit;
+    }
+#pragma warning(pop)
+    placeholder2 = placeholder1 + length;
+
+    //
+    // Create a pagefile-backed section for the buffer.
+    //
+
+    section = CreateFileMapping(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, static_cast<DWORD>(length), nullptr);
+    if (section == nullptr) {
+        EBPF_LOG_WIN32_API_FAILURE(EBPF_TRACELOG_KEYWORD_BASE, CreateFileMapping);
+        goto Exit;
+    }
+
+    //
+    // Map the section into the first placeholder region.
+    //
+    view1 =
+        MapViewOfFile3(section, nullptr, placeholder1, 0, length, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
+    if (view1 == nullptr) {
+        EBPF_LOG_WIN32_API_FAILURE(EBPF_TRACELOG_KEYWORD_BASE, MapViewOfFile3);
+        goto Exit;
+    }
+
+    //
+    // Ownership transferred, don't free this now.
+    //
+    placeholder1 = nullptr;
+
+    //
+    // Map the section into the second placeholder region.
+    //
+    view2 =
+        MapViewOfFile3(section, nullptr, placeholder2, 0, length, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
+    if (view2 == nullptr) {
+        EBPF_LOG_WIN32_API_FAILURE(EBPF_TRACELOG_KEYWORD_BASE, MapViewOfFile3);
+        goto Exit;
+    }
+
+    result = true;
+
+    //
+    // Success, return both mapped views to the caller.
+    //
+    descriptor->primary_view = view1;
+    descriptor->secondary_view = view2;
+
+    placeholder2 = nullptr;
+    view1 = nullptr;
+    view2 = nullptr;
+Exit:
+    if (!result) {
+        ebpf_free(descriptor);
+        descriptor = nullptr;
+    }
+
+    if (section != nullptr) {
+        CloseHandle(section);
+    }
+
+    if (placeholder1 != nullptr) {
+        VirtualFree(placeholder1, 0, MEM_RELEASE);
+    }
+
+    if (placeholder2 != nullptr) {
+        VirtualFree(placeholder2, 0, MEM_RELEASE);
+    }
+
+    if (view1 != nullptr) {
+        UnmapViewOfFileEx(view1, 0);
+    }
+
+    if (view2 != nullptr) {
+        UnmapViewOfFileEx(view2, 0);
+    }
+
+    EBPF_RETURN_POINTER(ebpf_ring_descriptor_t*, descriptor);
+}
+
+void
+ebpf_free_ring_buffer_memory(_Frees_ptr_opt_ ebpf_ring_descriptor_t* ring)
+{
+    EBPF_LOG_ENTRY();
+    if (ring) {
+        UnmapViewOfFile(ring->primary_view);
+        UnmapViewOfFile(ring->secondary_view);
+        ebpf_free(ring);
+    }
+    EBPF_RETURN_VOID();
+}
+
+void*
+ebpf_ring_descriptor_get_base_address(_In_ ebpf_ring_descriptor_t* ring_descriptor)
+{
+    return ring_descriptor->primary_view;
+}
+
+_Ret_maybenull_ void*
+ebpf_ring_map_readonly_user(_In_ ebpf_ring_descriptor_t* ring)
+{
+    EBPF_LOG_ENTRY();
+    EBPF_RETURN_POINTER(void*, ebpf_ring_descriptor_get_base_address(ring));
 }
 
 ebpf_result_t
 ebpf_protect_memory(_In_ const ebpf_memory_descriptor_t* memory_descriptor, ebpf_page_protection_t protection)
 {
+    EBPF_LOG_ENTRY();
     ULONG mm_protection_state = 0;
     ULONG old_mm_protection_state = 0;
     switch (protection) {
@@ -170,15 +311,16 @@ ebpf_protect_memory(_In_ const ebpf_memory_descriptor_t* memory_descriptor, ebpf
         mm_protection_state = PAGE_EXECUTE_READ;
         break;
     default:
-        return EBPF_INVALID_ARGUMENT;
+        EBPF_RETURN_RESULT(EBPF_INVALID_ARGUMENT);
     }
 
     if (!VirtualProtect(
             memory_descriptor->base, memory_descriptor->length, mm_protection_state, &old_mm_protection_state)) {
-        return EBPF_INVALID_ARGUMENT;
+        EBPF_LOG_WIN32_API_FAILURE(EBPF_TRACELOG_KEYWORD_BASE, VirtualProtect);
+        EBPF_RETURN_RESULT(EBPF_INVALID_ARGUMENT);
     }
 
-    return EBPF_SUCCESS;
+    EBPF_RETURN_RESULT(EBPF_SUCCESS);
 }
 
 void*
@@ -263,12 +405,65 @@ ebpf_interlocked_compare_exchange_int32(_Inout_ volatile int32_t* destination, i
     return InterlockedCompareExchange((long volatile*)destination, exchange, comperand);
 }
 
+void*
+ebpf_interlocked_compare_exchange_pointer(
+    _Inout_ void* volatile* destination, _In_opt_ const void* exchange, _In_opt_ const void* comperand)
+{
+    return InterlockedCompareExchangePointer((void* volatile*)destination, (void*)exchange, (void*)comperand);
+}
+
+uint32_t
+ebpf_random_uint32()
+{
+    std::random_device rd;
+    std::mt19937 mt(rd());
+    return mt();
+}
+
+uint64_t
+ebpf_query_time_since_boot(bool include_suspended_time)
+{
+    uint64_t interrupt_time;
+    if (include_suspended_time) {
+        // QueryUnbiasedInterruptTimePrecise returns A pointer to a ULONGLONG in which to receive the interrupt-time
+        // count in system time units of 100 nanoseconds.
+        // Unbiased Interrupt time is the total time since boot including time spent suspended.
+        // https://docs.microsoft.com/en-us/windows/win32/api/realtimeapiset/nf-realtimeapiset-queryunbiasedinterrupttimeprecise.
+        QueryUnbiasedInterruptTimePrecise(&interrupt_time);
+    } else {
+        // QueryInterruptTimePrecise returns A pointer to a ULONGLONG in which to receive the interrupt-time count in
+        // system time units of 100 nanoseconds.
+        // (Biased) Interrupt time is the total time since boot excluding time spent suspended.
+        // https://docs.microsoft.com/en-us/windows/win32/api/realtimeapiset/nf-realtimeapiset-queryinterrupttimeprecise.
+        QueryInterruptTimePrecise(&interrupt_time);
+    }
+
+    return interrupt_time;
+}
+
+ebpf_result_t
+ebpf_set_current_thread_affinity(uintptr_t new_thread_affinity_mask, _Out_ uintptr_t* old_thread_affinity_mask)
+{
+    uintptr_t old_mask = SetThreadAffinityMask(GetCurrentThread(), new_thread_affinity_mask);
+    if (old_mask == 0) {
+        return EBPF_OPERATION_NOT_SUPPORTED;
+    } else {
+        *old_thread_affinity_mask = old_mask;
+        return EBPF_SUCCESS;
+    }
+}
+
 void
-ebpf_get_cpu_count(_Out_ uint32_t* cpu_count)
+ebpf_restore_current_thread_affinity(uintptr_t old_thread_affinity_mask)
+{
+    SetThreadAffinityMask(GetCurrentThread(), old_thread_affinity_mask);
+}
+
+_Ret_range_(>, 0) uint32_t ebpf_get_cpu_count()
 {
     SYSTEM_INFO system_info;
     GetNativeSystemInfo(&system_info);
-    *cpu_count = system_info.dwNumberOfProcessors;
+    return system_info.dwNumberOfProcessors;
 }
 
 bool
@@ -410,7 +605,13 @@ int32_t
 ebpf_log_function(_In_ void* context, _In_z_ const char* format_string, ...)
 {
     UNREFERENCED_PARAMETER(context);
-    UNREFERENCED_PARAMETER(format_string);
+
+    va_list arg_start;
+    va_start(arg_start, format_string);
+
+    vprintf(format_string, arg_start);
+
+    va_end(arg_start);
     return 0;
 }
 
@@ -496,4 +697,19 @@ ebpf_validate_security_descriptor(
 
 Done:
     return result;
+}
+
+uint32_t
+ebpf_result_to_win32_error_code(ebpf_result_t result)
+{
+    static uint32_t (*RtlNtStatusToDosError)(NTSTATUS Status) = NULL;
+    if (!RtlNtStatusToDosError) {
+        HMODULE ntdll = LoadLibrary(L"ntdll.dll");
+        if (!ntdll) {
+            return ERROR_OUTOFMEMORY;
+        }
+        RtlNtStatusToDosError =
+            reinterpret_cast<decltype(RtlNtStatusToDosError)>(GetProcAddress(ntdll, "RtlNtStatusToDosError"));
+    }
+    return RtlNtStatusToDosError(ebpf_result_to_ntstatus(result));
 }

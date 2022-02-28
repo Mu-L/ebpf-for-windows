@@ -6,6 +6,9 @@
 #include "ebpf_windows.h"
 #include "framework.h"
 
+#include <TraceLoggingProvider.h>
+#include <winmeta.h>
+
 #ifdef __cplusplus
 extern "C"
 {
@@ -26,6 +29,9 @@ extern "C"
         ((uint8_t*)(x)), sizeof((x)) - 1      \
     }
 
+#define EBPF_CACHE_LINE_SIZE 64
+#define EBPF_CACHE_ALIGN_POINTER(P) (void*)(((uintptr_t)P + EBPF_CACHE_LINE_SIZE - 1) & ~(EBPF_CACHE_LINE_SIZE - 1))
+
     /**
      * @brief A UTF-8 encoded string.
      * Notes:
@@ -43,7 +49,7 @@ extern "C"
     typedef enum _ebpf_code_integrity_state
     {
         EBPF_CODE_INTEGRITY_DEFAULT = 0,
-        EBPF_CODE_INTEGRITY_HYPER_VISOR_KERNEL_MODE = 1
+        EBPF_CODE_INTEGRITY_HYPERVISOR_KERNEL_MODE = 1
     } ebpf_code_integrity_state_t;
 
     typedef struct _ebpf_non_preemptible_work_item ebpf_non_preemptible_work_item_t;
@@ -65,6 +71,12 @@ extern "C"
         void* data;
     } ebpf_extension_data_t;
 
+    typedef struct _ebpf_attach_provider_data
+    {
+        ebpf_program_type_t supported_program_type;
+    } ebpf_attach_provider_data_t;
+#define EBPF_ATTACH_PROVIDER_DATA_VERSION 1
+
     typedef struct _ebpf_trampoline_table ebpf_trampoline_table_t;
 
     typedef uintptr_t ebpf_lock_t;
@@ -76,6 +88,13 @@ extern "C"
     typedef uint32_t ebpf_security_access_mask_t;
 
     typedef struct _ebpf_helper_function_addresses ebpf_helper_function_addresses_t;
+
+    typedef enum _ebpf_hash_table_operations
+    {
+        EBPF_HASH_TABLE_OPERATION_ANY = 0,
+        EBPF_HASH_TABLE_OPERATION_INSERT = 1,
+        EBPF_HASH_TABLE_OPERATION_REPLACE = 2,
+    } ebpf_hash_table_operations_t;
 
     /**
      * @brief Initialize the eBPF platform abstraction layer.
@@ -94,11 +113,21 @@ extern "C"
 
     /**
      * @brief Allocate memory.
-     * @param[in] size Size of memory to allocate
+     * @param[in] size Size of memory to allocate.
      * @returns Pointer to memory block allocated, or null on failure.
      */
     __drv_allocatesMem(Mem) _Must_inspect_result_ _Ret_maybenull_
         _Post_writable_byte_size_(size) void* ebpf_allocate(size_t size);
+
+    /**
+     * @brief Rellocate memory.
+     * @param[in] memory Allocation to be reallocated.
+     * @param[in] old_size Old size of memory to reallocate.
+     * @param[in] new_size New size of memory to reallocate.
+     * @returns Pointer to memory block allocated, or null on failure.
+     */
+    __drv_allocatesMem(Mem) _Must_inspect_result_ _Ret_maybenull_
+        _Post_writable_byte_size_(new_size) void* ebpf_reallocate(_In_ void* memory, size_t old_size, size_t new_size);
 
     /**
      * @brief Free memory.
@@ -106,6 +135,21 @@ extern "C"
      */
     void
     ebpf_free(_Frees_ptr_opt_ void* memory);
+
+    /**
+     * @brief Allocate memory that has a starting address that is cache aligned.
+     * @param[in] size Size of memory to allocate
+     * @returns Pointer to memory block allocated, or null on failure.
+     */
+    __drv_allocatesMem(Mem) _Must_inspect_result_ _Ret_maybenull_
+        _Post_writable_byte_size_(size) void* ebpf_allocate_cache_aligned(size_t size);
+
+    /**
+     * @brief Free memory that has a starting address that is cache aligned.
+     * @param[in] memory Allocation to be freed.
+     */
+    void
+    ebpf_free_cache_aligned(_Frees_ptr_opt_ void* memory);
 
     typedef enum _ebpf_page_protection
     {
@@ -115,6 +159,7 @@ extern "C"
     } ebpf_page_protection_t;
 
     typedef struct _ebpf_memory_descriptor ebpf_memory_descriptor_t;
+    typedef struct _ebpf_ring_descriptor ebpf_ring_descriptor_t;
 
     /**
      * @brief Allocate pages from physical memory and create a mapping into the
@@ -159,6 +204,46 @@ extern "C"
      */
     void*
     ebpf_memory_descriptor_get_base_address(ebpf_memory_descriptor_t* memory_descriptor);
+
+    /**
+     * @brief Allocate pages from physical memory and create a mapping into the
+     * system address space with the same pages mapped twice.
+     *
+     * @param[in] length Size of memory to allocate (internally this gets rounded
+     * up to a page boundary).
+     * @return Pointer to an ebpf_memory_descriptor_t on success, NULL on failure.
+     */
+    _Ret_maybenull_ ebpf_ring_descriptor_t*
+    ebpf_allocate_ring_buffer_memory(size_t length);
+
+    /**
+     * @brief Release physical memory previously allocated via ebpf_allocate_ring_buffer_memory.
+     *
+     * @param[in] memory_descriptor Pointer to ebpf_ring_descriptor_t describing
+     * allocated pages.
+     */
+    void
+    ebpf_free_ring_buffer_memory(_Frees_ptr_opt_ ebpf_ring_descriptor_t* ring);
+
+    /**
+     * @brief Given an ebpf_ring_descriptor_t allocated via ebpf_allocate_ring_buffer_memory
+     * obtain the base virtual address.
+     *
+     * @param[in] memory_descriptor Pointer to an ebpf_ring_descriptor_t
+     * describing allocated pages.
+     * @return Base virtual address of pages that have been allocated.
+     */
+    void*
+    ebpf_ring_descriptor_get_base_address(_In_ ebpf_ring_descriptor_t* ring);
+
+    /**
+     * @brief Create a read-only mapping in the calling process of the ring buffer.
+     *
+     * @param[in] ring Ring buffer to map.
+     * @return Pointer to the base of the ring buffer.
+     */
+    _Ret_maybenull_ void*
+    ebpf_ring_map_readonly_user(_In_ ebpf_ring_descriptor_t* ring);
 
     /**
      * @brief Allocate and copy a UTF-8 string.
@@ -252,11 +337,9 @@ extern "C"
 
     /**
      * @brief Query the platform for the total number of CPUs.
-     * @param[out] cpu_count Pointer to memory location that contains the
-     *    number of CPUs.
+     * @return The count of logical cores in the system.
      */
-    void
-    ebpf_get_cpu_count(_Out_ uint32_t* cpu_count);
+    _Ret_range_(>, 0) uint32_t ebpf_get_cpu_count();
 
     /**
      * @brief Query the platform to determine if the current execution can
@@ -366,13 +449,6 @@ extern "C"
 
     typedef struct _ebpf_hash_table ebpf_hash_table_t;
 
-    typedef enum _ebpf_hash_table_compare_result
-    {
-        EBPF_HASH_TABLE_LESS_THAN = 0,
-        EBPF_HASH_TABLE_GREATER_THAN = 1,
-        EBPF_HASH_TABLE_EQUAL = 2,
-    } ebpf_hash_table_compare_result_t;
-
     /**
      * @brief Allocate and initialize a hash table.
      *
@@ -383,8 +459,10 @@ extern "C"
      * @param[in] free Function to use when freeing elements in the hash table.
      * @param[in] key_size Size of the keys used in the hash table.
      * @param[in] value_size Size of the values used in the hash table.
-     * @param[in] compare_function Function used to lexicographically order
-     * keys. If NULL, memcmp is used instead.
+     * @param[in] bucket_count Count of buckets to use.
+     * @param[in] extract_function Function used to convert a key into a value
+     * that can be hashed and compared. If NULL, key is assumes to be
+     * comparable.
      * @retval EBPF_SUCCESS The operation was successful.
      * @retval EBPF_NO_MEMORY Unable to allocate resources for this
      *  hash table.
@@ -396,7 +474,11 @@ extern "C"
         _In_ void (*free)(void* memory),
         size_t key_size,
         size_t value_size,
-        _In_opt_ ebpf_hash_table_compare_result_t (*compare_function)(const uint8_t* key1, const uint8_t* key2));
+        size_t bucket_count,
+        _In_opt_ void (*extract_function)(
+            _In_ const uint8_t* value,
+            _Outptr_result_buffer_((*length_in_bits + 7) / 8) const uint8_t** data,
+            _Out_ size_t* length_in_bits));
 
     /**
      * @brief Remove all items from the hash table and release memory.
@@ -423,13 +505,18 @@ extern "C"
      *
      * @param[in] hash_table Hash-table to update.
      * @param[in] key Key to find and insert or update.
-     * @param[in] value Value to insert into hash table.
+     * @param[in] value Value to insert into hash table or NULL to insert zero entry.
+     * @param[in] operation One of ebpf_hash_table_operations_t operations.
      * @retval EBPF_SUCCESS The operation was successful.
      * @retval EBPF_NO_MEMORY Unable to allocate memory for this
      *  entry in the hash table.
      */
     ebpf_result_t
-    ebpf_hash_table_update(_In_ ebpf_hash_table_t* hash_table, _In_ const uint8_t* key, _In_ const uint8_t* value);
+    ebpf_hash_table_update(
+        _In_ ebpf_hash_table_t* hash_table,
+        _In_ const uint8_t* key,
+        _In_opt_ const uint8_t* value,
+        ebpf_hash_table_operations_t operation);
 
     /**
      * @brief Remove an entry from the hash table.
@@ -472,6 +559,24 @@ extern "C"
         _In_ ebpf_hash_table_t* hash_table,
         _In_opt_ const uint8_t* previous_key,
         _Out_ uint8_t* next_key,
+        _Inout_opt_ uint8_t** next_value);
+
+    /**
+     * @brief Returns the next (key, value) pair in the hash table.
+     *
+     * @param[in] hash_table Hash-table to query.
+     * @param[in] previous_key Previous key or NULL to restart.
+     * @param[out] next_key_pointer Pointer to next key if one exists.
+     * @param[out] next_value If non-NULL, returns the next value if it exists.
+     * @retval EBPF_SUCCESS The operation was successful.
+     * @retval EBPF_NO_MORE_KEYS No keys exist in the hash table that
+     * are lexicographically after the specified key.
+     */
+    ebpf_result_t
+    ebpf_hash_table_next_key_pointer_and_value(
+        _In_ ebpf_hash_table_t* hash_table,
+        _In_opt_ const uint8_t* previous_key,
+        _Outptr_ uint8_t** next_key_pointer,
         _Outptr_opt_ uint8_t** next_value);
 
     /**
@@ -541,6 +646,25 @@ extern "C"
     int32_t
     ebpf_interlocked_compare_exchange_int32(_Inout_ volatile int32_t* destination, int32_t exchange, int32_t comperand);
 
+    /**
+     * @brief Performs an atomic operation that compares the input value pointed
+     *  to by destination with the value of comperand and replaces it with
+     *  exchange.
+     *
+     * @param[in,out] destination A pointer to the input value that is compared
+     *  with the value of comperand.
+     * @param[in] exchange Specifies the output value pointed to by destination
+     *  if the input value pointed to by destination equals the value of
+     *  comperand.
+     * @param[in] comperand Specifies the value that is compared with the input
+     *  value pointed to by destination.
+     * @return Returns the original value of memory pointed to by
+     *  destination.
+     */
+    void*
+    ebpf_interlocked_compare_exchange_pointer(
+        _Inout_ void* volatile* destination, _In_opt_ const void* exchange, _In_opt_ const void* comperand);
+
     typedef void (*ebpf_extension_change_callback_t)(
         _In_ void* client_binding_context,
         _In_ const void* provider_binding_context,
@@ -551,6 +675,7 @@ extern "C"
      *
      * @param[out] client_context Context used to unload the extension.
      * @param[in] interface_id GUID representing the identity of the interface.
+     * @param[in] client_module_id GUID representing the identity of the client.
      * @param[in] extension_client_context Opaque per-instance pointer passed to the extension.
      * @param[in] client_data Opaque client data passed to the extension or
         NULL if there is none.
@@ -572,6 +697,7 @@ extern "C"
     ebpf_extension_load(
         _Outptr_ ebpf_extension_client_t** client_context,
         _In_ const GUID* interface_id,
+        _In_ const GUID* client_module_id,
         _In_ void* extension_client_context,
         _In_opt_ const ebpf_extension_data_t* client_data,
         _In_opt_ const ebpf_extension_dispatch_table_t* client_dispatch_table,
@@ -593,6 +719,9 @@ extern "C"
     void*
     ebpf_extension_get_client_context(_In_ const void* extension_client_binding_context);
 
+    GUID
+    ebpf_extension_get_provider_guid(_In_ const void* extension_client_binding_context);
+
     /**
      * @brief Unload an extension.
      *
@@ -603,7 +732,7 @@ extern "C"
 
     typedef ebpf_result_t (*ebpf_provider_client_attach_callback_t)(
         void* context,
-        const GUID* client_id,
+        const GUID* client_module_id,
         void* client_binding_context,
         const ebpf_extension_data_t* client_data,
         const ebpf_extension_dispatch_table_t* client_dispatch_table);
@@ -615,6 +744,7 @@ extern "C"
      *
      * @param[out] provider_context Context used to unload the provider.
      * @param[in] interface_id GUID representing the identity of the interface.
+     * @param[in] provider_module_id GUID representing the identity of the provider.
      * @param[in] provider_data Opaque provider data.
      * @param[in] provider_dispatch_table Table of function pointers the
      *  provider exposes.
@@ -630,6 +760,7 @@ extern "C"
     ebpf_provider_load(
         _Outptr_ ebpf_extension_provider_t** provider_context,
         _In_ const GUID* interface_id,
+        _In_ const GUID* provider_module_id,
         _In_opt_ void* provider_binding_context,
         _In_opt_ const ebpf_extension_data_t* provider_data,
         _In_opt_ const ebpf_extension_dispatch_table_t* provider_dispatch_table,
@@ -676,14 +807,19 @@ extern "C"
      * @brief Populate the function pointers in a trampoline table.
      *
      * @param[in] trampoline_table Trampoline table to populate.
+     * @param[in] helper_function_count Count of helper functions.
+     * @param[in] helper_function_ids Array of helper function IDs.
      * @param[in] dispatch_table Dispatch table to populate from.
      * @retval EBPF_SUCCESS The operation was successful.
      * @retval EBPF_NO_MEMORY Unable to allocate resources for this
      *  operation.
+     * @retval EBPF_INVALID_ARGUMENT An invalid argument was supplied.
      */
     ebpf_result_t
     ebpf_update_trampoline_table(
         _Inout_ ebpf_trampoline_table_t* trampoline_table,
+        uint32_t helper_function_count,
+        _In_reads_(helper_function_count) const uint32_t* helper_function_ids,
         _In_ const ebpf_helper_function_addresses_t* helper_function_addresses);
 
     /**
@@ -700,6 +836,21 @@ extern "C"
     ebpf_result_t
     ebpf_get_trampoline_function(
         _In_ const ebpf_trampoline_table_t* trampoline_table, size_t index, _Out_ void** function);
+
+    /**
+     * @brief Get the address of the helper function from the trampoline table entry.
+     *
+     * @param[in] trampoline_table Trampoline table to query.
+     * @param[in] index Index of trampoline table entry.
+     * @param[out] helper_address Pointer to memory that contains the address to helper function on success.
+     * @retval EBPF_SUCCESS The operation was successful.
+     * @retval EBPF_NO_MEMORY Unable to allocate resources for this
+     *  operation.
+     * @retval EBPF_INVALID_ARGUMENT An invalid argument was supplied.
+     */
+    ebpf_result_t
+    ebpf_get_trampoline_helper_address(
+        _In_ const ebpf_trampoline_table_t* trampoline_table, size_t index, _Out_ void** helper_address);
 
     typedef struct _ebpf_program_info ebpf_program_info_t;
 
@@ -769,6 +920,259 @@ extern "C"
     ebpf_result_t
     ebpf_validate_security_descriptor(
         _In_ ebpf_security_descriptor_t* security_descriptor, size_t security_descriptor_length);
+
+    /**
+     * @brief Return a pseudorandom number.
+     *
+     * @return A pseudorandom number.
+     */
+    uint32_t
+    ebpf_random_uint32();
+
+    /**
+     * @brief Return time elapsed since boot in units of 100 nanoseconds.
+     *
+     * @param[in] include_suspended_time Include time the system spent in a suspended state.
+     * @return Time elapsed since boot in 100 nanosecond units.
+     */
+    uint64_t
+    ebpf_query_time_since_boot(bool include_suspended_time);
+
+    ebpf_result_t
+    ebpf_set_current_thread_affinity(uintptr_t new_thread_affinity_mask, _Out_ uintptr_t* old_thread_affinity_mask);
+
+    void
+    ebpf_restore_current_thread_affinity(uintptr_t old_thread_affinity_mask);
+
+    typedef _Return_type_success_(return >= 0) LONG NTSTATUS;
+
+    /**
+     * @brief Map an ebpf_result_t to a generic NTSTATUS code.
+     *
+     * @param[in] result ebpf_result_t to map.
+     * @return The generic NTSTATUS code.
+     */
+    NTSTATUS
+    ebpf_result_to_ntstatus(ebpf_result_t result);
+
+    /**
+     * @brief Map an ebpf_result_t to a generic Win32 error code.
+     *
+     * @param[in] result ebpf_result_t to map.
+     * @return The generic Win32 error code.
+     */
+    uint32_t
+    ebpf_result_to_win32_error_code(ebpf_result_t result);
+
+    TRACELOGGING_DECLARE_PROVIDER(ebpf_tracelog_provider);
+
+    ebpf_result_t
+    ebpf_trace_initiate();
+
+    void
+    ebpf_trace_terminate();
+
+#define EBPF_TRACELOG_EVENT_SUCCESS "EbpfSuccess"
+#define EBPF_TRACELOG_EVENT_GENERIC_ERROR "EbpfGenericError"
+#define EBPF_TRACELOG_EVENT_GENERIC_MESSAGE "EbpfGenericMessage"
+#define EBPF_TRACELOG_EVENT_API_ERROR "EbpfApiError"
+
+#define EBPF_TRACELOG_KEYWORD_FUNCTION_ENTRY_EXIT 0x1
+#define EBPF_TRACELOG_KEYWORD_BASE 0x2
+#define EBPF_TRACELOG_KEYWORD_ERROR 0x4
+#define EBPF_TRACELOG_KEYWORD_EPOCH 0x8
+#define EBPF_TRACELOG_KEYWORD_CORE 0x10
+#define EBPF_TRACELOG_KEYWORD_LINK 0x20
+#define EBPF_TRACELOG_KEYWORD_MAP 0x40
+#define EBPF_TRACELOG_KEYWORD_PROGRAM 0x80
+#define EBPF_TRACELOG_KEYWORD_API 0x100
+
+#define EBPF_TRACELOG_LEVEL_LOG_ALWAYS WINEVENT_LEVEL_LOG_ALWAYS
+#define EBPF_TRACELOG_LEVEL_CRITICAL WINEVENT_LEVEL_CRITICAL
+#define EBPF_TRACELOG_LEVEL_ERROR WINEVENT_LEVEL_ERROR
+#define EBPF_TRACELOG_LEVEL_WARNING WINEVENT_LEVEL_WARNING
+#define EBPF_TRACELOG_LEVEL_INFO WINEVENT_LEVEL_INFO
+#define EBPF_TRACELOG_LEVEL_VERBOSE WINEVENT_LEVEL_VERBOSE
+
+#define EBPF_LOG_FUNCTION_SUCCESS()                      \
+    TraceLoggingWrite(                                   \
+        ebpf_tracelog_provider,                          \
+        EBPF_TRACELOG_EVENT_SUCCESS,                     \
+        TraceLoggingLevel(WINEVENT_LEVEL_VERBOSE),       \
+        TraceLoggingKeyword(EBPF_TRACELOG_KEYWORD_BASE), \
+        TraceLoggingString(__FUNCTION__ " returned success", "Message"));
+
+#define EBPF_LOG_FUNCTION_ERROR(result)                                     \
+    TraceLoggingWrite(                                                      \
+        ebpf_tracelog_provider,                                             \
+        EBPF_TRACELOG_EVENT_GENERIC_ERROR,                                  \
+        TraceLoggingLevel(WINEVENT_LEVEL_ERROR),                            \
+        TraceLoggingKeyword(EBPF_TRACELOG_KEYWORD_ERROR),                   \
+        TraceLoggingString(__FUNCTION__ " returned error", "ErrorMessage"), \
+        TraceLoggingLong(result, "Error"));
+
+#define EBPF_LOG_ENTRY()                                                \
+    TraceLoggingWrite(                                                  \
+        ebpf_tracelog_provider,                                         \
+        EBPF_TRACELOG_EVENT_GENERIC_MESSAGE,                            \
+        TraceLoggingLevel(WINEVENT_LEVEL_VERBOSE),                      \
+        TraceLoggingKeyword(EBPF_TRACELOG_KEYWORD_FUNCTION_ENTRY_EXIT), \
+        TraceLoggingOpcode(WINEVENT_OPCODE_START),                      \
+        TraceLoggingString(__FUNCTION__, "<=="));
+
+#define EBPF_LOG_EXIT()                                                 \
+    TraceLoggingWrite(                                                  \
+        ebpf_tracelog_provider,                                         \
+        EBPF_TRACELOG_EVENT_GENERIC_MESSAGE,                            \
+        TraceLoggingLevel(WINEVENT_LEVEL_VERBOSE),                      \
+        TraceLoggingKeyword(EBPF_TRACELOG_KEYWORD_FUNCTION_ENTRY_EXIT), \
+        TraceLoggingOpcode(WINEVENT_OPCODE_STOP),                       \
+        TraceLoggingString(__FUNCTION__, "==>"));
+
+#define EBPF_RETURN_RESULT(status)                 \
+    do {                                           \
+        ebpf_result_t local_result = (status);     \
+        if (local_result == EBPF_SUCCESS) {        \
+            EBPF_LOG_FUNCTION_SUCCESS();           \
+        } else {                                   \
+            EBPF_LOG_FUNCTION_ERROR(local_result); \
+        }                                          \
+        return local_result;                       \
+    } while (false);
+
+#define EBPF_RETURN_NTSTATUS(status)               \
+    do {                                           \
+        ebpf_result_t local_result = (status);     \
+        if (!NT_SUCCESS(status)) {                 \
+            EBPF_LOG_FUNCTION_SUCCESS();           \
+        } else {                                   \
+            EBPF_LOG_FUNCTION_ERROR(local_result); \
+        }                                          \
+        return local_result;                       \
+    } while (false);
+
+#define EBPF_RETURN_POINTER(type, pointer)           \
+    do {                                             \
+        type local_result = (type)(pointer);         \
+        if (local_result != NULL) {                  \
+            EBPF_LOG_FUNCTION_SUCCESS();             \
+        } else {                                     \
+            EBPF_LOG_FUNCTION_ERROR(EBPF_NO_MEMORY); \
+        }                                            \
+        return local_result;                         \
+    } while (false);
+
+#define EBPF_RETURN_BOOL(flag)                    \
+    do {                                          \
+        bool local_result = (flag);               \
+        if (local_result) {                       \
+            EBPF_LOG_FUNCTION_SUCCESS();          \
+        } else {                                  \
+            EBPF_LOG_FUNCTION_ERROR(EBPF_FAILED); \
+        }                                         \
+        return local_result;                      \
+    } while (false);
+
+#define EBPF_RETURN_VOID() \
+    do {                   \
+        EBPF_LOG_EXIT();   \
+        return;            \
+    } while (false);
+
+#define EBPF_LOG_MESSAGE(trace_level, keyword, message) \
+    TraceLoggingWrite(                                  \
+        ebpf_tracelog_provider,                         \
+        EBPF_TRACELOG_EVENT_GENERIC_MESSAGE,            \
+        TraceLoggingLevel(trace_level),                 \
+        TraceLoggingKeyword((keyword)),                 \
+        TraceLoggingString(message, "Message"));
+
+#define EBPF_LOG_MESSAGE_UTF8_STRING(trace_level, keyword, message, string) \
+    TraceLoggingWrite(                                                      \
+        ebpf_tracelog_provider,                                             \
+        EBPF_TRACELOG_EVENT_GENERIC_MESSAGE,                                \
+        TraceLoggingLevel(trace_level),                                     \
+        TraceLoggingKeyword((keyword)),                                     \
+        TraceLoggingString(message, "Message"),                             \
+        TraceLoggingCountedUtf8String((const char*)(string).value, (ULONG)(string).length, #string));
+
+#define EBPF_LOG_MESSAGE_UINT64(trace_level, keyword, message, value) \
+    TraceLoggingWrite(                                                \
+        ebpf_tracelog_provider,                                       \
+        EBPF_TRACELOG_EVENT_GENERIC_MESSAGE,                          \
+        TraceLoggingLevel((trace_level)),                             \
+        TraceLoggingKeyword((keyword)),                               \
+        TraceLoggingString((message), "Message"),                     \
+        TraceLoggingUInt64((value), (#value)));
+
+#define EBPF_LOG_MESSAGE_UINT64_UINT64(trace_level, keyword, message, value1, value2) \
+    TraceLoggingWrite(                                                                \
+        ebpf_tracelog_provider,                                                       \
+        EBPF_TRACELOG_EVENT_GENERIC_MESSAGE,                                          \
+        TraceLoggingLevel((trace_level)),                                             \
+        TraceLoggingKeyword((keyword)),                                               \
+        TraceLoggingString((message), "Message"),                                     \
+        TraceLoggingUInt64((value1), (#value1)),                                      \
+        TraceLoggingUInt64((value2), (#value2)));
+
+#define EBPF_LOG_MESSAGE_POINTER_ENUM(trace_level, keyword, message, pointer, enum) \
+    TraceLoggingWrite(                                                              \
+        ebpf_tracelog_provider,                                                     \
+        EBPF_TRACELOG_EVENT_GENERIC_MESSAGE,                                        \
+        TraceLoggingLevel((trace_level)),                                           \
+        TraceLoggingKeyword((keyword)),                                             \
+        TraceLoggingString((message), "Message"),                                   \
+        TraceLoggingPointer((pointer), (#pointer)),                                 \
+        TraceLoggingUInt32((enum), (#enum)));
+
+#define EBPF_LOG_MESSAGE_GUID(trace_level, keyword, message, guid) \
+    TraceLoggingWrite(                                             \
+        ebpf_tracelog_provider,                                    \
+        EBPF_TRACELOG_EVENT_GENERIC_MESSAGE,                       \
+        TraceLoggingLevel((trace_level)),                          \
+        TraceLoggingKeyword((keyword)),                            \
+        TraceLoggingString((message), "Message"),                  \
+        TraceLoggingGuid((guid), (#guid)));
+
+#define EBPF_LOG_MESSAGE_GUID_GUID(trace_level, keyword, message, guid1, guid2) \
+    TraceLoggingWrite(                                                          \
+        ebpf_tracelog_provider,                                                 \
+        EBPF_TRACELOG_EVENT_GENERIC_MESSAGE,                                    \
+        TraceLoggingLevel((trace_level)),                                       \
+        TraceLoggingKeyword((keyword)),                                         \
+        TraceLoggingString((message), "Message"),                               \
+        TraceLoggingGuid((guid1), (#guid1)),                                    \
+        TraceLoggingGuid((guid2), (#guid2)));
+
+#define EBPF_LOG_MESSAGE_STRING(trace_level, keyword, message, string) \
+    TraceLoggingWrite(                                                 \
+        ebpf_tracelog_provider,                                        \
+        EBPF_TRACELOG_EVENT_GENERIC_MESSAGE,                           \
+        TraceLoggingLevel(trace_level),                                \
+        TraceLoggingKeyword((keyword)),                                \
+        TraceLoggingString(message, "Message"),                        \
+        TraceLoggingString(string, #string));
+
+#define EBPF_LOG_WIN32_API_FAILURE(keyword, api)          \
+    do {                                                  \
+        DWORD last_error = GetLastError();                \
+        TraceLoggingWrite(                                \
+            ebpf_tracelog_provider,                       \
+            EBPF_TRACELOG_EVENT_API_ERROR,                \
+            TraceLoggingLevel(EBPF_TRACELOG_LEVEL_ERROR), \
+            TraceLoggingKeyword((keyword)),               \
+            TraceLoggingString(#api, "Api"),              \
+            TraceLoggingWinError(last_error));            \
+    } while (false);
+
+#define EBPF_LOG_NTSTATUS_API_FAILURE(keyword, api, status) \
+    TraceLoggingWrite(                                      \
+        ebpf_tracelog_provider,                             \
+        EBPF_TRACELOG_EVENT_GENERIC_MESSAGE,                \
+        TraceLoggingLevel(EBPF_TRACELOG_LEVEL_ERROR),       \
+        TraceLoggingKeyword((keyword)),                     \
+        TraceLoggingString(#api, "api"),                    \
+        TraceLoggingNTStatus(status));
 
 #ifdef __cplusplus
 }

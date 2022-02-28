@@ -11,6 +11,7 @@
 #include <ntddk.h>
 #include <netioddk.h>
 #include <stdint.h>
+#include <wdm.h>
 
 #define bool BOOLEAN
 #define true 1
@@ -24,3 +25,5 @@
 #define ebpf_list_is_empty IsListEmpty
 #define ebpf_list_insert_tail InsertTailList
 #define ebpf_list_remove_entry RemoveEntryList
+#define ebpf_list_remove_head_entry RemoveHeadList
+#define ebpf_list_append_tail_list AppendTailList

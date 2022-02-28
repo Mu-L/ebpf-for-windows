@@ -1,229 +1,116 @@
-/*
- *  Copyright (c) Microsoft Corporation
- *  SPDX-License-Identifier: MIT
- */
+// Copyright (c) Microsoft Corporation
+// SPDX-License-Identifier: MIT
 
 #pragma once
 
 #include <stdbool.h>
 #include <stdint.h>
-#include "ebpf_execution_type.h"
-#include "ebpf_result.h"
 #include "ebpf_core_structs.h"
+#include "ebpf_execution_type.h"
+#include "ebpf_program_attach_type_guids.h"
 #include "ebpf_result.h"
-#include "ebpf_windows.h"
 
 #ifdef __cplusplus
 extern "C"
 {
 #endif
 
-    __declspec(selectany) ebpf_attach_type_t EBPF_ATTACH_TYPE_UNSPECIFIED = {0};
-
-    /** @brief Attach type for handling incoming packets as early as possible.
-     *
-     * Program type: \ref EBPF_PROGRAM_TYPE_XDP
-     */
-    __declspec(selectany) ebpf_attach_type_t EBPF_ATTACH_TYPE_XDP = {
-        0x85e0d8ef, 0x579e, 0x4931, {0xb0, 0x72, 0x8e, 0xe2, 0x26, 0xbb, 0x2e, 0x9d}};
-
-    /** @brief Attach type for handling socket bind() requests.
-     *
-     * Program type: \ref EBPF_PROGRAM_TYPE_BIND
-     */
-    __declspec(selectany) ebpf_attach_type_t EBPF_ATTACH_TYPE_BIND = {
-        0xb9707e04, 0x8127, 0x4c72, {0x83, 0x3e, 0x05, 0xb1, 0xfb, 0x43, 0x94, 0x96}};
-
-    __declspec(selectany) ebpf_attach_type_t EBPF_ATTACH_TYPE_TEST = {
-        0xf788ef4b, 0x207d, 0x4dc3, {0x85, 0xcf, 0x0f, 0x2e, 0xa1, 0x07, 0x21, 0x3c}};
-
-    __declspec(selectany) ebpf_attach_type_t EBPF_PROGRAM_TYPE_UNSPECIFIED = {0};
-
-    /** @brief Program type for handling incoming packets as early as possible.
-     *
-     * eBPF program prototype: \ref xdp_hook_t
-     *
-     * Attach type(s): \ref EBPF_ATTACH_TYPE_XDP
-     *
-     * Helpers available: see ebpf_helpers.h
-     */
-    __declspec(selectany) ebpf_program_type_t EBPF_PROGRAM_TYPE_XDP = {
-        0xf1832a85, 0x85d5, 0x45b0, {0x98, 0xa0, 0x70, 0x69, 0xd6, 0x30, 0x13, 0xb0}};
-
-    /** @brief Program type for handling socket bind() requests.
-     *
-     * eBPF program prototype: \ref bind_hook_t
-     *
-     * Attach type(s): \ref EBPF_ATTACH_TYPE_BIND
-     *
-     * Helpers available: see ebpf_helpers.h
-     */
-    __declspec(selectany) ebpf_program_type_t EBPF_PROGRAM_TYPE_BIND = {
-        0x608c517c, 0x6c52, 0x4a26, {0xb6, 0x77, 0xbb, 0x1c, 0x34, 0x42, 0x5a, 0xdf}};
-
-    __declspec(selectany) ebpf_program_type_t EBPF_PROGRAM_TYPE_TEST = {
-        0xf788ef4a, 0x207d, 0x4dc3, {0x85, 0xcf, 0x0f, 0x2e, 0xa1, 0x07, 0x21, 0x3c}};
-
     typedef int32_t fd_t;
-    const fd_t ebpf_fd_invalid = -1;
-    typedef void* ebpf_handle_t;
-    const ebpf_handle_t ebpf_handle_invalid = (ebpf_handle_t)-1;
+    extern __declspec(selectany) const fd_t ebpf_fd_invalid = -1;
+    typedef intptr_t ebpf_handle_t;
     typedef struct _tlv_type_length_value tlv_type_length_value_t;
 
-    struct _ebpf_object;
-    struct _ebpf_program;
-    struct _ebpf_map;
-
-    /**
-     *  @brief Initialize the eBPF user mode library.
-     */
-    uint32_t
-    ebpf_api_initiate();
-
-    /**
-     *  @brief Terminate the eBPF user mode library.
-     */
-    void
-    ebpf_api_terminate();
-
-    /**
-     * @brief Load an eBFP program into the kernel execution context.
-     * @param[in] file An ELF file containing one or more eBPF programs.
-     * @param[in] section_name Name of the section in the ELF file to load.
-     * @param[in] execution_type How this program should be run in the execution
-     * context.
-     * @param[out] handle Handle to eBPF program.
-     * @param[in,out] count_of_map_handles On input, contains the maximum number of map_handles to return.
-     * On output, contains the actual number of map_handles returned.
-     * @param[out] map_handles Array of map handles to be filled in.
-     * @param[out] error_message Error message describing what failed.
-     */
-    ebpf_result_t
-    ebpf_api_load_program(
-        const char* file,
-        const char* section_name,
-        ebpf_execution_type_t execution_type,
-        ebpf_handle_t* handle,
-        uint32_t* count_of_map_handles,
-        ebpf_handle_t* map_handles,
-        const char** error_message);
+    struct bpf_object;
+    struct bpf_program;
+    struct bpf_map;
+    struct bpf_link;
 
     /**
      * @brief Create an eBPF map with input parameters.
-     * @param[in] type Map type.
+     *
+     * @param[in] map_type Map type.
      * @param[in] key_size Key size.
      * @param[in] value_size Value size.
      * @param[in] max_entries Maximum number of entries in the map.
-     * @param[in] map_flags Map flags.
-     * @param[out] handle Pointer to map handle.
+     * @param[in] map_flags This is reserved and should be 0.
+     * @param[out] map_fd File descriptor for the created map. The caller needs to
+     *  call _close() on the returned fd when done.
      *
      * @retval EBPF_SUCCESS Map created successfully.
      * @retval EBPF_ERROR_NOT_SUPPORTED Unsupported map type.
      * @retval EBPF_INVALID_ARGUMENT One or more parameters are incorrect.
      */
     ebpf_result_t
-    ebpf_api_create_map(
-        ebpf_map_type_t type,
+    ebpf_create_map(
+        ebpf_map_type_t map_type,
         uint32_t key_size,
         uint32_t value_size,
         uint32_t max_entries,
         uint32_t map_flags,
-        _Out_ ebpf_handle_t* handle);
+        _Out_ fd_t* map_fd);
 
     /**
-     * @brief Find an element in an eBPF map.
-     * @param[in] handle Handle to eBPF map.
-     * @param[in] key_size Size of the key buffer.
-     * @param[in] key Pointer to buffer containing key.
-     * @param[in] value_size Size of the value buffer.
-     * @param[out] value Pointer to buffer that contains value on success.
-     */
-    uint32_t
-    ebpf_api_map_find_element(
-        ebpf_handle_t handle, uint32_t key_size, const uint8_t* key, uint32_t value_size, uint8_t* value);
-
-    /**
-     * @brief Update an element in an eBPF map.
-     * @param[in] handle Handle to eBPF map.
-     * @param[in] key_size Size of the key buffer.
-     * @param[in] key Pointer to buffer containing key.
-     * @param[in] value_size Size of the value buffer.
-     * @param[out] value Pointer to buffer containing value.
-     */
-    uint32_t
-    ebpf_api_map_update_element(
-        ebpf_handle_t handle, uint32_t key_size, const uint8_t* key, uint32_t value_size, const uint8_t* value);
-
-    /**
-     * @brief Delete an element in an eBPF map.
-     * @param[in] handle Handle to eBPF map.
-     * @param[in] key_size Size of the key buffer.
-     * @param[in] key Pointer to buffer containing key.
-     */
-    uint32_t
-    ebpf_api_map_delete_element(ebpf_handle_t handle, uint32_t key_size, const uint8_t* key);
-
-    /**
-     * @brief Return the next key in an eBPF map.
-     * @param[in] handle Handle to eBPF map.
-     * @param[in] key_size Size of the key buffer.
-     * @param[in] previous_key Pointer to buffer containing
-     previous key or NULL to restart enumeration.
-     * @param[out] next_key Pointer to buffer that contains next
-     * key on success.
-     * @retval ERROR_NO_MORE_ITEMS previous_key was the last key.
-     */
-    uint32_t
-    ebpf_api_get_next_map_key(ebpf_handle_t handle, uint32_t key_size, const uint8_t* previous_key, uint8_t* next_key);
-
-    /**
-     * @brief Get the next eBPF map.
-     * @param[in] previous_handle Handle to previous eBPF map or
-     *  ebpf_handle_invalid to start enumeration.
-     * @param[out] next_handle The next eBPF map or ebpf_handle_invalid if this
-     *  is the last map.
-     */
-    uint32_t
-    ebpf_api_get_next_map(ebpf_handle_t previous_handle, ebpf_handle_t* next_handle);
-
-    /**
-     * @brief Get the next eBPF program.
-     * @param[in] previous_handle Handle to previous eBPF program or
-     *  ebpf_handle_invalid to start enumeration.
-     * @param[out] next_handle The next eBPF program or ebpf_handle_invalid if this
-     *  is the last map.
-     */
-    uint32_t
-    ebpf_api_get_next_program(ebpf_handle_t previous_handle, ebpf_handle_t* next_handle);
-
-    /**
-     * @brief Query properties of an eBPF map.
-     * @param[in] handle Handle to an eBPF map.
-     * @param[out] size Size of the eBPF map definition.
-     * @param[out] type Type of the eBPF map.
-     * @param[out] key_size Size of keys in the eBPF map.
-     * @param[out] value_size Size of values in the eBPF map.
-     * @param[out] max_entries Maximum number of entries in the map.
+     * @brief Create an eBPF map with input parameters.
+     *
+     * @param[in] type Map type.
+     * @param[in] name Optionally, the map name.
+     * @param[in] key_size Key size.
+     * @param[in] value_size Value size.
+     * @param[in] max_entries Maximum number of entries in the map.
+     * @param[in] map_flags This is reserved and should be 0.
+     * @param[out] map_fd File descriptor for the created map. The caller needs to
+     *  call _close() on the returned fd when done.
+     *
+     * @retval EBPF_SUCCESS Map created successfully.
+     * @retval EBPF_ERROR_NOT_SUPPORTED Unsupported map type.
+     * @retval EBPF_INVALID_ARGUMENT One or more parameters are incorrect.
      */
     ebpf_result_t
-    ebpf_api_map_query_definition(
-        ebpf_handle_t handle,
-        uint32_t* size,
-        uint32_t* type,
-        uint32_t* key_size,
-        uint32_t* value_size,
-        uint32_t* max_entries);
+    ebpf_create_map_name(
+        ebpf_map_type_t type,
+        _In_opt_z_ const char* name,
+        uint32_t key_size,
+        uint32_t value_size,
+        uint32_t max_entries,
+        uint32_t map_flags,
+        _Out_ fd_t* map_fd);
+
+    /**
+     * @brief Get file descriptor to the next eBPF map.
+     * @param[in] previous_fd FD to previous eBPF map or ebpf_fd_invalid to
+     *  start enumeration.
+     * @param[out] next_fd FD to the next eBPF map or ebpf_fd_invalid if this
+     *  is the last map.
+     * @retval EBPF_SUCCESS The operation was successful.
+     */
+    ebpf_result_t
+    ebpf_get_next_map(fd_t previous_fd, _Out_ fd_t* next_fd);
+
+    /**
+     * @brief Get file descriptor to the next eBPF program.
+     * @param[in] previous_fd File descriptor of the previous eBPF program or ebpf_fd_invalid to
+     *  start enumeration.
+     * @param[out] next_fd File descriptor of the next eBPF program or ebpf_fd_invalid if
+     *  this is the last program.
+     * @retval EBPF_SUCCESS The operation was successful.
+     */
+    ebpf_result_t
+    ebpf_get_next_program(fd_t previous_fd, _Out_ fd_t* next_fd);
 
     /**
      * @brief Query info about an eBPF program.
-     * @param[in] handle Handle to an eBPF program.
+     * @param[in] fd File descriptor of an eBPF program.
      * @param[out] execution_type On success, contains the execution type.
      * @param[out] file_name On success, contains the file name.
      * @param[out] section_name On success, contains the section name.
+     * @retval EBPF_SUCCESS The operation was successful.
      */
-    uint32_t
-    ebpf_api_program_query_info(
-        ebpf_handle_t handle, ebpf_execution_type_t* execution_type, const char** file_name, const char** section_name);
+    ebpf_result_t
+    ebpf_program_query_info(
+        fd_t fd,
+        _Out_ ebpf_execution_type_t* execution_type,
+        _Outptr_result_z_ const char** file_name,
+        _Outptr_result_z_ const char** section_name);
 
     /**
      * @brief Get list of programs and stats in an ELF eBPF file.
@@ -315,21 +202,21 @@ extern "C"
     ebpf_free_string(_In_opt_ _Post_invalid_ const char* string);
 
     /**
-     * @brief Associate a name with an object handle.
-     * @param[in] handle Handle to object.
-     * @param[in] name Name to associate with handle.
-     * @param[in] name_length Length in bytes of the name.
-     */
-    uint32_t
-    ebpf_api_pin_object(ebpf_handle_t handle, const uint8_t* name, uint32_t name_length);
-
-    /**
      * @brief Dissociate a name with an object handle.
      * @param[in] name Name to dissociate.
      * @param[in] name_length Length in bytes of the name.
      */
     uint32_t
     ebpf_api_unpin_object(const uint8_t* name, uint32_t name_length);
+
+    /**
+     * @brief Unpin the object from the specified path.
+     * @param[in] path Path from which to unpin.
+     *
+     * @retval EBPF_SUCCESS The operation was successful.
+     */
+    ebpf_result_t
+    ebpf_object_unpin(_In_z_ const char* path);
 
     /**
      * @brief Find a map given its associated name.
@@ -355,13 +242,24 @@ extern "C"
     ebpf_api_link_program(ebpf_handle_t program_handle, ebpf_attach_type_t attach_type, ebpf_handle_t* link_handle);
 
     /**
+     * @brief Detach the eBPF program from the link.
+     *
+     * @param[in] link_handle Handle to the link.
+     *
+     * @retval ERROR_SUCCESS The operations succeeded.
+     * @retval ERROR_INVALID_PARAMETER The link handle is invalid.
+     */
+    uint32_t
+    ebpf_api_unlink_program(ebpf_handle_t link_handle);
+
+    /**
      * @brief Close an eBPF handle.
      *
      * @param[in] handle Handle to close.
-     * @retval ERROR_SUCCESS Handle was closed.
-     * @retval ERROR_INVALID_HANDLE Handle is not valid.
+     * @retval EBPF_SUCCESS Handle was closed.
+     * @retval EBPF_INVALID_OBJECT Handle is not valid.
      */
-    uint32_t
+    ebpf_result_t
     ebpf_api_close_handle(ebpf_handle_t handle);
 
     /**
@@ -411,13 +309,13 @@ extern "C"
      *  EBPF_EXECUTION_ANY is specified, execution type will be decided by a
      *  system-wide policy.
      * @param[out] object Returns pointer to ebpf_object object. The caller
-        is expected to call ebpf_object_close() at the end.
+     *  is expected to call bpf_object__close() at the end.
      * @param[out] program_fd Returns a file descriptor for the first program.
      *  The caller should not call _close() on the fd, but should instead use
-     *  ebpf_object_close() to close this (and other) file descriptors.
+     *  bpf_object__close() to close this (and other) file descriptors.
      * @param[out] log_buffer Returns a pointer to a null-terminated log buffer.
      *  The caller is responsible for freeing the returned log_buffer pointer
-     *  by calling ebpf_api_free_string().
+     *  by calling ebpf_free_string().
      *
      * @retval EBPF_SUCCESS The programs are loaded and maps are created successfully.
      * @retval EBPF_INVALID_ARGUMENT One or more parameters are incorrect.
@@ -431,76 +329,174 @@ extern "C"
         _In_opt_ const ebpf_program_type_t* program_type,
         _In_opt_ const ebpf_attach_type_t* attach_type,
         _In_ ebpf_execution_type_t execution_type,
-        _Outptr_ struct _ebpf_object** object,
+        _Outptr_ struct bpf_object** object,
         _Out_ fd_t* program_fd,
         _Outptr_result_maybenull_z_ const char** log_buffer);
 
     /**
-     * @brief Get next program in ebpf_object object.
+     * @brief Load an eBPF programs from raw instructions.
      *
-     * @param[in] previous Pointer to previous eBPF program, or NULL to get the first one.
-     * @param[in] object Pointer to eBPF object.
-     * @return Pointer to the next program, or NULL if none.
+     * @param[in] program_type The eBPF program type.
+     * @param[in] execution_type The execution type to use for this program. If
+     *  EBPF_EXECUTION_ANY is specified, execution type will be decided by a
+     *  system-wide policy.
+     * @param[in] byte_code The eBPF program byte code.
+     * @param[in] byte_code_size Size in bytes (not instruction count) of the
+     *  eBPF program byte code.
+     * @param[out] log_buf The buffer in which to write log messages.
+     * @param[in] log_buf_sz Size in bytes of the caller's log buffer.
+     * @param[out] program_fd Returns a file descriptor for the program.
+     *  The caller should call _close() on the fd to close this when done.
+     *
+     * @retval EBPF_SUCCESS The operation was successful.
+     * @retval EBPF_INVALID_ARGUMENT One or more parameters are incorrect.
+     * @retval EBPF_NO_MEMORY Out of memory.
+     * @retval EBPF_VERIFICATION_FAILED The program failed verification.
+     * @retval EBPF_FAILED Some other error occured.
      */
-    _Ret_maybenull_ struct _ebpf_program*
-    ebpf_program_next(_In_opt_ const struct _ebpf_program* previous, _In_ const struct _ebpf_object* object);
+    ebpf_result_t
+    ebpf_program_load_bytes(
+        _In_ const ebpf_program_type_t* program_type,
+        ebpf_execution_type_t execution_type,
+        _In_reads_(byte_code_size) const uint8_t* byte_code,
+        uint32_t byte_code_size,
+        _Out_writes_opt_(log_buf_sz) char* log_buf,
+        size_t log_buf_sz,
+        _Out_ fd_t* program_fd);
 
     /**
-     * @brief Get previous program in ebpf_object object.
+     * @brief Attach an eBPF program.
      *
-     * @param[in] next Pointer to next eBPF program, or NULL to get the last one.
-     * @param[in] object Pointer to eBPF object.
-     * @return Pointer to the previous program, or NULL if none.
+     * @param[in] program Pointer to the eBPF program.
+     * @param[in] attach_type Optionally, the attach type for attaching the program.
+     *  If attach type is not specified, then the earlier provided attach type
+     *  or attach type derived from section prefix will be used to attach the
+     *  program.
+     * @param[in] attach_params_size Size of the attach parameters.
+     * @param[in] attach_parameters Optionally, attach parameters. This is an
+     *  opaque flat buffer containing the attach parameters which is interpreted
+     *  by the extension provider.
+     * @param[out] link Pointer to ebpf_link structure.
+     *
+     * @retval EBPF_SUCCESS The operation was successful.
      */
-    _Ret_maybenull_ struct _ebpf_program*
-    ebpf_program_previous(_In_opt_ const struct _ebpf_program* next, _In_ const struct _ebpf_object* object);
+    ebpf_result_t
+    ebpf_program_attach(
+        _In_ const struct bpf_program* program,
+        _In_opt_ const ebpf_attach_type_t* attach_type,
+        _In_reads_bytes_opt_(attach_params_size) void* attach_parameters,
+        _In_ size_t attach_params_size,
+        _Outptr_ struct bpf_link** link);
 
     /**
-     * @brief Get next map in ebpf_object object.
+     * @brief Attach an eBPF program by program file descriptor.
      *
-     * @param[in] previous Pointer to previous eBPF map, or NULL to get the first one.
-     * @param[in] object Pointer to eBPF object.
-     * @return Pointer to the next map, or NULL if none.
+     * @param[in] program_fd An eBPF program file descriptor.
+     * @param[in] attach_type Optionally, the attach type for attaching the program.
+     *  If attach type is not specified, then the earlier provided attach type
+     *  or attach type derived from section prefix will be used to attach the
+     *  program.
+     * @param[in] attach_parameters_size Size of the attach parameters.
+     * @param[in] attach_parameters Optionally, attach parameters. This is an
+     *  opaque flat buffer containing the attach parameters which is interpreted
+     *  by the extension provider.
+     * @param[out] link Pointer to ebpf_link structure.
+     *
+     * @retval EBPF_SUCCESS The operation was successful.
      */
-    _Ret_maybenull_ struct _ebpf_map*
-    ebpf_map_next(_In_opt_ const struct _ebpf_map* previous, _In_ const struct _ebpf_object* object);
+    ebpf_result_t
+    ebpf_program_attach_by_fd(
+        fd_t program_fd,
+        _In_opt_ const ebpf_attach_type_t* attach_type,
+        _In_reads_bytes_opt_(attach_parameters_size) void* attach_parameters,
+        _In_ size_t attach_parameters_size,
+        _Outptr_ struct bpf_link** link);
 
     /**
-     * @brief Get previous map in ebpf_object object.
+     * @brief Detach an eBPF program from an attach point represented by
+     *  the bpf_link structure.
      *
-     * @param[in] next Pointer to next eBPF map, or NULL to get the last one.
-     * @param[in] object Pointer to eBPF object.
-     * @return Pointer to the previous map, or NULL if none.
+     * @param[in] link Pointer to bpf_link structure.
+     *
+     * @retval EBPF_SUCCESS The operation was successful.
+     * @retval EBPF_INVALID_OBJECT Invalid object was passed.
      */
-    _Ret_maybenull_ struct _ebpf_map*
-    ebpf_map_previous(_In_opt_ const struct _ebpf_map* next, _In_ const struct _ebpf_object* object);
+    ebpf_result_t
+    ebpf_link_detach(_In_ struct bpf_link* link);
 
     /**
-     * @brief Fetch fd for a program object.
+     * Clean up and free bpf_link structure. Also close the
+     * underlying link fd.
      *
-     * @param[in] program Pointer to eBPF program.
-     * @return fd for the program on success, ebpf_fd_invalid on failure.
+     * @param[in] link Pointer to the bpf_link structure.
+     *
+     * @retval EBPF_SUCCESS The operation was successful.
+     * @retval EBPF_INVALID_ARGUMENT Invalid argument was provided.
+     *
+     * @sa bpf_link__destroy
+     * @sa bpf_link_detach
      */
-    fd_t
-    ebpf_program_get_fd(_In_ const struct _ebpf_program* program);
+    ebpf_result_t
+    ebpf_link_close(_In_ struct bpf_link* link);
 
     /**
-     * @brief Fetch fd for a map object.
+     * @brief Close a file descriptor. Also close the underlying handle.
+     * @param [in] fd File descriptor to be closed.
      *
-     * @param[in] map Pointer to eBPF map.
-     * @return fd for the map on success, ebpf_fd_invalid on failure.
+     * @retval EBPF_SUCCESS The operation was successful.
+     * @retval EBPF_INVALID_FD Invalid fd was provided.
      */
-    fd_t
-    ebpf_map_get_fd(_In_ const struct _ebpf_map* map);
+    ebpf_result_t
+    ebpf_close_fd(fd_t fd);
 
     /**
-     * @brief Clean up ebpf_object. Also delete all the sub objects
-     * (maps, programs) and close the related file descriptors.
+     * @brief Get a program type and expected attach type by name.
      *
-     * @param[in] object Pointer to ebpf_object.
+     * @param[in] name Name, as if it were a section name in an ELF file.
+     * @param[out] program_type Program type.
+     * @param[out] expected_attach_type Expected attach type.
+     *
+     * @retval EBPF_SUCCESS The operation was successful.
+     * @retval EBPF_KEY_NOT_FOUND No program type was found.
      */
-    void
-    ebpf_object_close(_In_ _Post_invalid_ struct _ebpf_object* object);
+    ebpf_result_t
+    ebpf_get_program_type_by_name(
+        _In_z_ const char* name,
+        _Out_ ebpf_program_type_t* program_type,
+        _Out_ ebpf_attach_type_t* expected_attach_type);
+
+    /**
+     * @brief Get the name of a given program type.
+     *
+     * @param[in] program_type Program type.
+     *
+     * @returns Name of the program type, or NULL if not found.
+     */
+    _Ret_maybenull_z_ const char*
+    ebpf_get_program_type_name(_In_ const ebpf_program_type_t* program_type);
+
+    /**
+     * @brief Get the name of a given attach type.
+     *
+     * @param[in] attach_type Attach type.
+     *
+     * @returns Name of the attach type, or NULL if not found.
+     */
+    _Ret_maybenull_z_ const char*
+    ebpf_get_attach_type_name(_In_ const ebpf_attach_type_t* attach_type);
+
+    /**
+     * @brief Gets the next pinned program after a given path.
+     *
+     * @param[in] start_path Path to look for an entry greater than.
+     * @param[out] next_path Returns the next path, if one exists.
+     *
+     * @retval EBPF_SUCCESS The operation was successful.
+     * @retval EBPF_NO_MORE_KEYS No more entries found.
+     */
+    ebpf_result_t
+    ebpf_get_next_pinned_program_path(
+        _In_z_ const char* start_path, _Out_writes_z_(EBPF_MAX_PIN_PATH_LENGTH) char* next_path);
 
 #ifdef __cplusplus
 }

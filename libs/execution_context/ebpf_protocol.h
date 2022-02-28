@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 #pragma once
+
+// This file must only include headers that are safe
+// to include in both user mode and kernel mode.
 #include "ebpf_core_structs.h"
-#include "ebpf_helpers.h"
-#include "ebpf_windows.h"
 
 typedef enum _ebpf_operation_id
 {
@@ -15,19 +16,31 @@ typedef enum _ebpf_operation_id
     EBPF_OPERATION_LOAD_CODE,
     EBPF_OPERATION_MAP_FIND_ELEMENT,
     EBPF_OPERATION_MAP_UPDATE_ELEMENT,
+    EBPF_OPERATION_MAP_UPDATE_ELEMENT_WITH_HANDLE,
     EBPF_OPERATION_MAP_DELETE_ELEMENT,
     EBPF_OPERATION_MAP_GET_NEXT_KEY,
     EBPF_OPERATION_GET_NEXT_MAP,
     EBPF_OPERATION_GET_NEXT_PROGRAM,
-    EBPF_OPERATION_QUERY_MAP_DEFINITION,
     EBPF_OPERATION_QUERY_PROGRAM_INFO,
     EBPF_OPERATION_UPDATE_PINNING,
     EBPF_OPERATION_GET_PINNING,
     EBPF_OPERATION_LINK_PROGRAM,
+    EBPF_OPERATION_UNLINK_PROGRAM,
     EBPF_OPERATION_CLOSE_HANDLE,
     EBPF_OPERATION_GET_EC_FUNCTION,
     EBPF_OPERATION_GET_PROGRAM_INFO,
     EBPF_OPERATION_GET_MAP_INFO,
+    EBPF_OPERATION_GET_LINK_HANDLE_BY_ID,
+    EBPF_OPERATION_GET_MAP_HANDLE_BY_ID,
+    EBPF_OPERATION_GET_PROGRAM_HANDLE_BY_ID,
+    EBPF_OPERATION_GET_NEXT_LINK_ID,
+    EBPF_OPERATION_GET_NEXT_MAP_ID,
+    EBPF_OPERATION_GET_NEXT_PROGRAM_ID,
+    EBPF_OPERATION_GET_OBJECT_INFO,
+    EBPF_OPERATION_GET_NEXT_PINNED_PROGRAM_PATH,
+    EBPF_OPERATION_BIND_MAP,
+    EBPF_OPERATION_RING_BUFFER_MAP_QUERY_BUFFER,
+    EBPF_OPERATION_RING_BUFFER_MAP_ASYNC_QUERY,
 } ebpf_operation_id_t;
 
 typedef enum _ebpf_code_type
@@ -51,27 +64,27 @@ typedef enum _ebpf_ec_function
 typedef struct _ebpf_operation_resolve_helper_request
 {
     struct _ebpf_operation_header header;
-    uint64_t program_handle;
+    ebpf_handle_t program_handle;
     uint32_t helper_id[1];
 } ebpf_operation_resolve_helper_request_t;
 
 typedef struct _ebpf_operation_resolve_helper_reply
 {
     struct _ebpf_operation_header header;
-    uint64_t address[1];
+    uintptr_t address[1];
 } ebpf_operation_resolve_helper_reply_t;
 
 typedef struct _ebpf_operation_resolve_map_request
 {
     struct _ebpf_operation_header header;
-    uint64_t program_handle;
-    uint64_t map_handle[1];
+    ebpf_handle_t program_handle;
+    ebpf_handle_t map_handle[1];
 } ebpf_operation_resolve_map_request_t;
 
 typedef struct _ebpf_operation_resolve_map_reply
 {
     struct _ebpf_operation_header header;
-    uint64_t address[1];
+    uintptr_t address[1];
 } ebpf_operation_resolve_map_reply_t;
 
 typedef struct _ebpf_operation_create_program_request
@@ -86,13 +99,13 @@ typedef struct _ebpf_operation_create_program_request
 typedef struct _ebpf_operation_create_program_reply
 {
     struct _ebpf_operation_header header;
-    uint64_t program_handle;
+    ebpf_handle_t program_handle;
 } ebpf_operation_create_program_reply_t;
 
 typedef struct _ebpf_operation_load_code_request
 {
     struct _ebpf_operation_header header;
-    uint64_t program_handle;
+    ebpf_handle_t program_handle;
     ebpf_code_type_t code_type;
     uint8_t code[1];
 } ebpf_operation_load_code_request_t;
@@ -100,19 +113,22 @@ typedef struct _ebpf_operation_load_code_request
 typedef struct _ebpf_operation_create_map_request
 {
     struct _ebpf_operation_header header;
-    struct _ebpf_map_definition ebpf_map_definition;
+    ebpf_map_definition_in_memory_t ebpf_map_definition;
+    ebpf_handle_t inner_map_handle;
+    uint8_t data[1];
 } ebpf_operation_create_map_request_t;
 
 typedef struct _ebpf_operation_create_map_reply
 {
     struct _ebpf_operation_header header;
-    uint64_t handle;
+    ebpf_handle_t handle;
 } ebpf_operation_create_map_reply_t;
 
 typedef struct _ebpf_operation_map_find_element_request
 {
     struct _ebpf_operation_header header;
-    uint64_t handle;
+    ebpf_handle_t handle;
+    bool find_and_delete;
     uint8_t key[1];
 } ebpf_operation_map_find_element_request_t;
 
@@ -125,58 +141,68 @@ typedef struct _ebpf_operation_map_find_element_reply
 typedef struct _ebpf_operation_map_update_element_request
 {
     struct _ebpf_operation_header header;
-    uint64_t handle;
+    ebpf_handle_t handle;
+    ebpf_map_option_t option;
     uint8_t data[1]; // data is key+value
 } epf_operation_map_update_element_request_t;
+
+typedef struct _ebpf_operation_map_update_element_with_handle_request
+{
+    struct _ebpf_operation_header header;
+    ebpf_handle_t map_handle;
+    ebpf_handle_t value_handle;
+    ebpf_map_option_t option;
+    uint8_t key[1];
+} ebpf_operation_map_update_element_with_handle_request_t;
 
 typedef struct _ebpf_operation_map_delete_element_request
 {
     struct _ebpf_operation_header header;
-    uint64_t handle;
+    ebpf_handle_t handle;
     uint8_t key[1];
 } ebpf_operation_map_delete_element_request_t;
 
 typedef struct _ebpf_operation_get_next_map_request
 {
     struct _ebpf_operation_header header;
-    uint64_t previous_handle;
-} ebpf_operation_get_next_map_request;
+    ebpf_handle_t previous_handle;
+} ebpf_operation_get_next_map_request_t;
 
 typedef struct _ebpf_operation_get_next_map_reply
 {
     struct _ebpf_operation_header header;
-    uint64_t next_handle;
+    ebpf_handle_t next_handle;
 } ebpf_operation_get_next_map_reply_t;
 
 typedef struct _ebpf_operation_get_next_program_request
 {
     struct _ebpf_operation_header header;
-    uint64_t previous_handle;
-} ebpf_operation_get_next_program_request;
+    ebpf_handle_t previous_handle;
+} ebpf_operation_get_next_program_request_t;
 
 typedef struct _ebpf_operation_get_next_program_reply
 {
     struct _ebpf_operation_header header;
-    uint64_t next_handle;
+    ebpf_handle_t next_handle;
 } ebpf_operation_get_next_program_reply_t;
 
-typedef struct _ebpf_operation_query_map_definition_request
+typedef struct _ebpf_operation_get_handle_by_id_request
 {
     struct _ebpf_operation_header header;
-    uint64_t handle;
-} ebpf_operation_query_map_definition_request;
+    ebpf_id_t id;
+} ebpf_operation_get_handle_by_id_request_t;
 
-typedef struct _ebpf_operation_query_map_definition_reply
+typedef struct _ebpf_operation_get_handle_by_id_reply
 {
     struct _ebpf_operation_header header;
-    struct _ebpf_map_definition map_definition;
-} ebpf_operation_query_map_definition_reply;
+    ebpf_handle_t handle;
+} ebpf_operation_get_handle_by_id_reply_t;
 
 typedef struct _ebpf_operation_query_program_info_request
 {
     struct _ebpf_operation_header header;
-    uint64_t handle;
-} ebpf_operation_query_program_info_request;
+    ebpf_handle_t handle;
+} ebpf_operation_query_program_info_request_t;
 
 typedef struct _ebpf_operation_query_program_info_reply
 {
@@ -185,58 +211,65 @@ typedef struct _ebpf_operation_query_program_info_reply
     uint16_t file_name_offset;
     uint16_t section_name_offset;
     uint8_t data[1];
-} ebpf_operation_query_program_info_reply;
+} ebpf_operation_query_program_info_reply_t;
 
 typedef struct _ebpf_operation_map_get_next_key_request
 {
     struct _ebpf_operation_header header;
-    uint64_t handle;
+    ebpf_handle_t handle;
     uint8_t previous_key[1];
 } ebpf_operation_map_get_next_key_request_t;
 
 typedef struct _ebpf_operation_map_get_next_key_reply
 {
     struct _ebpf_operation_header header;
-    uint64_t handle;
+    ebpf_handle_t handle;
     uint8_t next_key[1];
 } ebpf_operation_map_get_next_key_reply_t;
 
 typedef struct _ebpf_operation_update_map_pinning_request
 {
     struct _ebpf_operation_header header;
-    uint64_t handle;
-    uint8_t name[1];
+    ebpf_handle_t handle;
+    uint8_t path[1];
 } ebpf_operation_update_pinning_request_t;
 
 typedef struct _ebpf_operation_get_pinning_request
 {
     struct _ebpf_operation_header header;
-    uint8_t name[1];
+    uint8_t path[1];
 } ebpf_operation_get_pinning_request_t;
 
 typedef struct _ebpf_operation_get_pinning_reply
 {
     struct _ebpf_operation_header header;
-    uint64_t handle;
+    ebpf_handle_t handle;
 } ebpf_operation_get_map_pinning_reply_t;
 
 typedef struct _ebpf_operation_link_program_request
 {
     struct _ebpf_operation_header header;
-    uint64_t program_handle;
+    ebpf_handle_t program_handle;
     ebpf_attach_type_t attach_type;
+    uint8_t data[1];
 } ebpf_operation_link_program_request_t;
 
 typedef struct _ebpf_operation_link_program_reply
 {
     struct _ebpf_operation_header header;
-    uint64_t link_handle;
+    ebpf_handle_t link_handle;
 } ebpf_operation_link_program_reply_t;
+
+typedef struct _ebpf_operation_unlink_program_request
+{
+    struct _ebpf_operation_header header;
+    ebpf_handle_t link_handle;
+} ebpf_operation_unlink_program_request_t;
 
 typedef struct _ebpf_operation_close_handle_request
 {
     struct _ebpf_operation_header header;
-    uint64_t handle;
+    ebpf_handle_t handle;
 } ebpf_operation_close_handle_request_t;
 
 typedef struct _ebpf_operation_get_ec_function_request
@@ -248,13 +281,14 @@ typedef struct _ebpf_operation_get_ec_function_request
 typedef struct _ebpf_operation_get_ec_function_reply
 {
     struct _ebpf_operation_header header;
-    uint64_t address;
+    uintptr_t address;
 } ebpf_operation_get_ec_function_reply_t;
 
 typedef struct _ebpf_operation_get_program_info_request
 {
     struct _ebpf_operation_header header;
     ebpf_program_type_t program_type;
+    ebpf_handle_t program_handle;
 } ebpf_operation_get_program_info_request_t;
 
 typedef struct _ebpf_operation_get_program_info_reply
@@ -268,7 +302,7 @@ typedef struct _ebpf_operation_get_program_info_reply
 typedef struct _ebpf_operation_get_map_info_request
 {
     struct _ebpf_operation_header header;
-    uint64_t handle;
+    ebpf_handle_t handle;
 } ebpf_operation_get_map_info_request_t;
 
 typedef struct _ebpf_operation_get_map_info_reply
@@ -278,3 +312,73 @@ typedef struct _ebpf_operation_get_map_info_reply
     size_t size;
     uint8_t data[1];
 } ebpf_operation_get_map_info_reply_t;
+
+typedef struct _ebpf_operation_get_next_id_request
+{
+    struct _ebpf_operation_header header;
+    ebpf_id_t start_id;
+} ebpf_operation_get_next_id_request_t;
+
+typedef struct _ebpf_operation_get_next_id_reply
+{
+    struct _ebpf_operation_header header;
+    ebpf_id_t next_id;
+} ebpf_operation_get_next_id_reply_t;
+
+typedef struct _ebpf_operation_get_next_pinned_path_request
+{
+    struct _ebpf_operation_header header;
+    uint8_t start_path[1];
+} ebpf_operation_get_next_pinned_path_request_t;
+
+typedef struct _ebpf_operation_get_next_pinned_path_reply
+{
+    struct _ebpf_operation_header header;
+    uint8_t next_path[1];
+} ebpf_operation_get_next_pinned_path_reply_t;
+
+typedef struct _ebpf_operation_get_object_info_request
+{
+    struct _ebpf_operation_header header;
+    ebpf_handle_t handle;
+} ebpf_operation_get_object_info_request_t;
+
+typedef struct _ebpf_operation_get_object_info_reply
+{
+    struct _ebpf_operation_header header;
+    uint8_t info[1];
+} ebpf_operation_get_object_info_reply_t;
+
+typedef struct _ebpf_operation_bind_map_request
+{
+    struct _ebpf_operation_header header;
+    ebpf_handle_t program_handle;
+    ebpf_handle_t map_handle;
+} ebpf_operation_bind_map_request_t;
+
+typedef struct _ebpf_operation_ring_buffer_map_query_buffer_request
+{
+    struct _ebpf_operation_header header;
+    ebpf_handle_t map_handle;
+} ebpf_operation_ring_buffer_map_query_buffer_request_t;
+
+typedef struct _ebpf_operation_ring_buffer_map_query_buffer_reply
+{
+    struct _ebpf_operation_header header;
+    // Address to user-space read-only buffer for the ring-buffer records.
+    uint64_t buffer_address;
+} ebpf_operation_ring_buffer_map_query_buffer_reply_t;
+
+typedef struct _ebpf_operation_ring_buffer_map_async_query_request
+{
+    struct _ebpf_operation_header header;
+    ebpf_handle_t map_handle;
+    // Offset till which the consumer has read data so far.
+    size_t consumer_offset;
+} ebpf_operation_ring_buffer_map_async_query_request_t;
+
+typedef struct _ebpf_operation_ring_buffer_map_async_query_reply
+{
+    struct _ebpf_operation_header header;
+    ebpf_ring_buffer_map_async_query_result_t async_query_result;
+} ebpf_operation_ring_buffer_map_async_query_reply_t;

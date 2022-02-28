@@ -40,24 +40,37 @@ static thread_local std::map<GUID, ebpf_program_info_ptr_t, guid_compare> _progr
 
 static thread_local std::map<GUID, ebpf_helper::ebpf_memory_ptr, guid_compare> _static_program_info_cache;
 
+static thread_local ebpf_handle_t _program_under_verification = ebpf_handle_invalid;
+
+void
+set_program_under_verification(ebpf_handle_t program)
+{
+    _program_under_verification = program;
+}
+
 void
 clear_program_info_cache()
 {
     _program_info_cache.clear();
 }
 
+#define GET_PROGRAM_INFO_REPLY_BUFFER_SIZE 2048
+
 ebpf_result_t
 get_program_info_data(ebpf_program_type_t program_type, _Outptr_ ebpf_program_info_t** program_info)
 {
-    ebpf_protocol_buffer_t reply_buffer(1024);
+    ebpf_protocol_buffer_t reply_buffer(GET_PROGRAM_INFO_REPLY_BUFFER_SIZE);
     size_t required_buffer_length;
     ebpf_operation_get_program_info_request_t request{
-        sizeof(request), ebpf_operation_id_t::EBPF_OPERATION_GET_PROGRAM_INFO, program_type};
+        sizeof(request),
+        ebpf_operation_id_t::EBPF_OPERATION_GET_PROGRAM_INFO,
+        program_type,
+        _program_under_verification};
 
     *program_info = nullptr;
 
     auto reply = reinterpret_cast<ebpf_operation_get_program_info_reply_t*>(reply_buffer.data());
-    ebpf_result_t result = windows_error_to_ebpf_result(invoke_ioctl(request, reply_buffer));
+    ebpf_result_t result = win32_error_code_to_ebpf_result(invoke_ioctl(request, reply_buffer));
     if ((result != EBPF_SUCCESS) && (result != EBPF_INSUFFICIENT_BUFFER))
         goto Exit;
 
@@ -65,7 +78,7 @@ get_program_info_data(ebpf_program_type_t program_type, _Outptr_ ebpf_program_in
         required_buffer_length = reply->header.length;
         reply_buffer.resize(required_buffer_length);
         reply = reinterpret_cast<ebpf_operation_get_program_info_reply_t*>(reply_buffer.data());
-        result = windows_error_to_ebpf_result(invoke_ioctl(request, reply_buffer));
+        result = win32_error_code_to_ebpf_result(invoke_ioctl(request, reply_buffer));
         if (result != EBPF_SUCCESS)
             goto Exit;
     }
@@ -150,7 +163,7 @@ _get_helper_function_prototype(const ebpf_program_info_t* info, unsigned int n)
 
 // Check whether a given integer is a valid helper ID.
 bool
-is_helper_usable_windows(unsigned int n)
+is_helper_usable_windows(int32_t n)
 {
     const ebpf_program_info_t* info;
     ebpf_result_t result = get_program_type_info(&info);
@@ -162,7 +175,7 @@ is_helper_usable_windows(unsigned int n)
 
 // Get the prototype for the helper with a given ID.
 EbpfHelperPrototype
-get_helper_prototype_windows(unsigned int n)
+get_helper_prototype_windows(int32_t n)
 {
     const ebpf_program_info_t* info;
     ebpf_result_t result = get_program_type_info(&info);
